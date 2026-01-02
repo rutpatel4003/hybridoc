@@ -7,7 +7,6 @@ from pdf_loader import load_uploaded_file
 LOADING_MESSAGES = [
     "Hold on, I'm wrestling with some digital hamsters... literally.",
     "Loading... please try not to panic, you magnificent disaster.",
-    "Just a moment, I'm busy f***king up the space-time continuum. Oops.",
     "Locating the internet... it was around here somewhere. Have you checked under the couch?",
     "Convincing the AI not to turn evil. It's currently at a 'maybe,' so please be polite.",
     "Updating your patience levels. Please wait while we ignore your sense of urgency.",

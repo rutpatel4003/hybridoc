@@ -13,6 +13,7 @@ from langgraph.graph import StateGraph, START, END
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.prompts.chat import MessagesPlaceholder
 from pdf_loader import File
+from langchain_core.output_parsers import StrOutputParser
 
 close_tag = '</think>'
 tag_length = len(close_tag)
@@ -33,9 +34,11 @@ class State(TypedDict):
 
 
 SYSTEM_PROMPT = """
-You are a strict document assistant. Use ONLY the provided context to answer. 
-If the answer is not in the context, explicitly say you cannot find it. 
-DO NOT use outside knowledge or make up facts.
+You are a highly precise technical expert. Answer the question using ONLY the provided context.
+- START your answer immediately with the facts.
+- DO NOT use filler phrases like "Based on the context" or "According to the excerpts."
+- If the answer is not in the context, state: "Information not found in document."
+- Format math using LaTeX.
 """.strip()
 
 PROMPT = """
@@ -96,7 +99,11 @@ class FinalAnswerEvent:
     content: str
 
 def _remove_thinking_from_message(message: str) -> str:
-    return message[message.find(close_tag) + tag_length:].strip()
+    # handle cases where the tag might not exist
+    if close_tag in message:
+        # find the end of the tag and then .lstrip() to remove 
+        return message[message.find(close_tag) + tag_length:].lstrip()
+    return message.strip()
 
 def create_history(welcome_message: Message) -> List[Message]:
     return [welcome_message]
@@ -130,11 +137,43 @@ class Chatbot:
         answer = self.llm.invoke(messages)
         return {"answer": answer}
     
-    def _create_workflow(self) -> CompiledStateGraph:
-        graph_builder = StateGraph(State).add_sequence([self._retrieve, self._generate])
-        graph_builder.add_edge(START, '_retrieve')
-        return graph_builder.compile()
+    def _condense_question(self, state: State):
+        """
+        Takes the chat history and the current question, rewrites the question to be standalone so the vector store can understand it. 
+        """
+        chat_history = state.get('chat_history', [])
+        question = state['question']
+        
+        # if no chat history exists, return the question as it is 
+        if not chat_history:
+            return {"question": question}
+        condense_system_prompt = (
+            "Given a chat history and the latest user question "
+            "which might reference context in the chat history, "
+            "formulate a standalone question which can be understood "
+            "without the chat history. Do NOT answer the question, "
+            "just reformulate it if needed and otherwise return it as is."
+        )
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", condense_system_prompt),
+            MessagesPlaceholder(variable_name='chat_history'),
+            ("human", "{question}"),
+        ])
+
+        chain = prompt | self.llm | StrOutputParser()
+        reformulated_question = chain.invoke({
+            "chat_history": chat_history,
+            "question": question
+        })
+        
+        # update the state with the new question
+        return {"question": reformulated_question}
     
+    def _create_workflow(self) -> CompiledStateGraph:
+        graph_builder = StateGraph(State).add_sequence([self._condense_question, self._retrieve, self._generate])
+        graph_builder.add_edge(START, '_condense_question')
+        return graph_builder.compile()
+
     def _ask_model(
             self, prompt: str, chat_history: List[Message]
     ) -> Iterable[SourcesEvent | ChunkEvent | FinalAnswerEvent]:
@@ -151,8 +190,10 @@ class Chatbot:
             payload, config=config, stream_mode=['updates', 'messages']
         ):
             if event_type =='messages':
-                chunk, _ = event_data
-                yield ChunkEvent(chunk.content)
+                chunk, metadata = event_data
+                if metadata.get('langgraph_node') == '_generate':
+                    if chunk.content:
+                        yield ChunkEvent(chunk.content)
             if event_type == 'updates':
                 if "_retrieve" in event_data:
                     documents = event_data['_retrieve']['context']

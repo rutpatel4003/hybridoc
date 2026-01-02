@@ -9,10 +9,11 @@ class Config:
     class Model:
             NAME = 'qwen3:4b'
             TEMPERATURE = 0.6
+            HISTORY_REPHRASER_LLM_NAME = 'qwen3:0.6b'
 
     class Preprocessing: 
-        CHUNK_SIZE = 1028
-        CHUNK_OVERLAP = 128
+        CHUNK_SIZE = 512
+        CHUNK_OVERLAP = 100
         EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
         RERANKER = 'ms-marco-MiniLM-L-12-v2'
         LLM = 'qwen3:4b'
