@@ -11,6 +11,9 @@ from langchain_ollama import ChatOllama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from config import Config
 from pdf_loader import File
+from langchain_chroma import Chroma
+import hashlib
+
 CONTEXT_PROMPT = ChatPromptTemplate.from_template(
     """
 You're an expert in document analysis. Your task is to provide brief, relevant context for a chunk of text from the given documents.
@@ -44,7 +47,7 @@ text_splitter = RecursiveCharacterTextSplitter(
 )
 
 def create_llm() -> ChatOllama:
-    return ChatOllama(model=Config.Preprocessing.LLM, temperature=0, keep_alive=1)
+    return ChatOllama(model=Config.Preprocessing.LLM, temperature=0, keep_alive=-1)
 
 def create_reranker() -> FlashrankRerank:
     return FlashrankRerank(model = Config.Preprocessing.RERANKER, top_n = Config.Chatbot.N_CONTEXT_RESULTS)
@@ -69,23 +72,104 @@ def _create_chunks(document: Document) -> List[Document]:
         contextual_chunks.append(Document(page_content=chunk_with_context, metadata=c.metadata))
     return contextual_chunks
 
+def _calculate_file_hash(content: str) -> str:
+    """
+    Calculate hash of file content for deduplication
+    """
+    return hashlib.md5(content.encode('utf-8')).hexdigest()
 
 def ingest_files(files: List[File]) -> BaseRetriever:
-    documents = [Document(file.content, metadata={"source": file.name}) for file in files]
-    chunks = []
-    for doc in documents:
-        chunks.extend(_create_chunks(doc))
+    """
+    Ingests into a Persistent Vector Database (Chroma)
+    Implements 'Incremental Indexing' to skip files that are already indexed
+    """
+    #initialize embeddings
+    embedding_model = create_embeddings()
 
-    if not chunks:
-        raise ValueError("No text could be extracted from these files. Please check if the PDFs are empty or scanned images.")
-
-    semantic_retriever = InMemoryVectorStore.from_documents(chunks, create_embeddings()).as_retriever(search_kwargs={"k":Config.Preprocessing.N_SEMANTIC_RESULTS})
-
-    bm25_retriever = BM25Retriever.from_documents(chunks)
-    bm25_retriever.k = Config.Preprocessing.N_BM25_RESULTS
-    
-    ensemble_retriever = EnsembleRetriever(retrievers=[semantic_retriever, bm25_retriever], weights=[0.6, 0.4],)
-
-    return ContextualCompressionRetriever(
-        base_compressor=create_reranker(), base_retriever=ensemble_retriever
+    # connect to persistent db on disk
+    vector_store = Chroma(
+        collection_name='private-rag',
+        embedding_function=embedding_model,
+        persist_directory=str(Config.Path.VECTOR_DB_DIR)
     )
+
+    # check for duplicated files
+    try:
+        existing_data = vector_store.get()
+        existing_sources = {}
+        if existing_data and 'metadatas' in existing_data:
+            for m in existing_data['metadatas']:
+                if m and 'source' in m:
+                    source_name = m['source']
+                    file_hash = m.get('content_hash', None)
+                    existing_sources[source_name] = file_hash
+        print(f'Found {len(existing_sources)} files in database')
+        print(f'Files: {list(existing_sources.keys())}')
+    except Exception as e:
+        print(f'Error reading database: {e}')
+        existing_sources = {}
+
+    # filter new files only
+    new_chunks = []
+    skipped_files = []
+
+    for f in files:
+        file_hash = _calculate_file_hash(f.content)
+        if f.name in existing_sources:
+            stored_hash = existing_sources[f.name]
+            if stored_hash == file_hash:
+                print(f'Skipping {f.name} (already indexed)')
+                continue
+            else:
+                print(f'File {f.name} content changed - reprocessing')
+
+        # If it is a new file to process
+        print(f"Indexing: {f.name}")
+        doc = Document(f.content, metadata={'source': f.name, 'content_hash': file_hash})
+        file_chunks = _create_chunks(doc)
+        for chunk in file_chunks:
+            chunk.metadata['content_hash'] = file_hash
+        
+        new_chunks.extend(file_chunks)
+
+    if skipped_files:
+        print(f'Loaded {len(skipped_files)} from cache.')
+
+    # add new chunks to the db only
+    if new_chunks:
+        print(f'Adding {len(new_chunks)} new chunks to the Vector Database')
+        vector_store.add_documents(new_chunks)
+
+    # create vector retriever
+    semantic_retriever = vector_store.as_retriever(
+        search_kwargs={'k':Config.Preprocessing.N_SEMANTIC_RESULTS}
+    )
+
+    # create bm25 retriever 
+    all_docs = []
+
+    db_state = vector_store.get()
+    stored_texts = db_state.get('documents', [])
+    stored_metadatas = db_state.get('metadatas', [])
+    if not stored_texts:
+        raise ValueError('Database is empty! Please upload a document.')
+    
+    # reconstruct document objects for langchain
+    global_corpus = []
+    for t, m in zip(stored_texts, stored_metadatas):
+        safe_m = m if m else {} # in case if metadata is none
+        global_corpus.append(Document(page_content=t, metadata=safe_m))
+
+    print(f'Building BM25 Index on {len(global_corpus)} total chunks')
+    bm25_retriever = BM25Retriever.from_documents(global_corpus)
+    bm25_retriever.k = Config.Preprocessing.N_BM25_RESULTS
+
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[semantic_retriever, bm25_retriever],
+        weights=[0.6, 0.4]
+    )
+
+    return ContextualCompressionRetriever(base_compressor=create_reranker(), base_retriever=ensemble_retriever)
+
+
+

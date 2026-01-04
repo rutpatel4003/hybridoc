@@ -7,6 +7,7 @@ import torch
 from transformers import AutoProcessor, AutoModelForImageTextToText
 from PIL import Image
 import io
+import hashlib
 
 TEXT_FILE_EXTENSION = ".txt"
 MD_FILE_EXTENSION = '.md'
@@ -19,7 +20,6 @@ _got_processor = None
 def get_got_ocr_model():
     """
     Lazy-load GOT-OCR2 model.
-    Uses ~2.3GB VRAM with float16 precision.
     """
     global _got_model, _got_processor
     
@@ -153,7 +153,9 @@ class File:
     content: str
 
 def load_uploaded_file(uploaded_file: UploadedFile) -> File:
-    """load and process uploaded file."""
+    """
+    load and process uploaded file with persistent disk caching.
+    """
     file_extension = Path(uploaded_file.name).suffix
     
     if file_extension not in Config.ALLOWED_FILE_EXTENSIONS:
@@ -161,17 +163,34 @@ def load_uploaded_file(uploaded_file: UploadedFile) -> File:
             f"Invalid file extension: {file_extension} for file {uploaded_file.name}"
         )
     
-    if file_extension == PDF_FILE_EXTENSION:
-        return File(
-            name=uploaded_file.name,
-            content=extract_pdf_content(uploaded_file.getvalue(), use_got_ocr=True)
-        )
+    # get raw bytes to generate a unique hash for this specific file content
+    file_bytes = uploaded_file.getvalue()
+    file_hash = hashlib.md5(file_bytes).hexdigest()
     
-    # Text/MD fallback
-    return File(
-        name=uploaded_file.name,
-        content=uploaded_file.getvalue().decode("utf-8")
-    )
+    # define cache directory and file path
+    cache_dir = Config.Path.DATA_DIR / "ocr_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{file_hash}.txt"
+
+    # load from disk if file is processed already
+    if cache_path.exists():
+        print(f"🔄 Cache hit: Loading processed text for {uploaded_file.name}")
+        with open(cache_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return File(name=uploaded_file.name, content=content)
+    
+    # if not in cache, run the ocr extraction
+    print(f"Running extraction for {uploaded_file.name}")
+    if file_extension == PDF_FILE_EXTENSION:
+        content = extract_pdf_content(file_bytes, use_got_ocr=True)
+    else:
+        content = file_bytes.decode("utf-8")
+    
+    # save the result to avoid running OCR on this file again
+    with open(cache_path, "w", encoding="utf-8") as f:
+        f.write(content)
+        
+    return File(name=uploaded_file.name, content=content)
 
 # cleanup function to free GPU memory when done
 def cleanup_got_model():

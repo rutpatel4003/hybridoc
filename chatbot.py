@@ -14,6 +14,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.prompts.chat import MessagesPlaceholder
 from pdf_loader import File
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.callbacks import StreamingStdOutCallbackHandler
+import json
 
 close_tag = '</think>'
 tag_length = len(close_tag)
@@ -123,10 +125,14 @@ class Chatbot:
         self.files = files
         self.retriever = ingest_files(files)
         self.llm = ChatOllama(model=Config.Model.NAME,
-                              temperature=Config.Model.TEMPERATURE,
-                              num_ctx=4096,
-                              verbose=False,
-                              keep_alive=1)
+                            temperature=Config.Model.TEMPERATURE,
+                            num_ctx=4096,
+                            num_predict=1028, 
+                            num_thread=8,      
+                            verbose=False,
+                            keep_alive=-1,
+                            streaming=True,
+                            callbacks=[StreamingStdOutCallbackHandler()])
         self.workflow = self._create_workflow()
 
     def _format_docs(self, docs: List[Document]) -> str:
@@ -144,20 +150,35 @@ class Chatbot:
         print('Document Relevance Checking in Process!')
         question = state['question']
         documents = state['context']
+        docs_text = "\n\n".join([
+            f"Document {i+1}:\n{doc.page_content[:500]}" for i, doc in enumerate(documents) 
+        ]) # batching documents to query faster
         prompt = ChatPromptTemplate.from_messages([
-            ('system', GRADER_SYSTEM_PROMPT),
-            ('human', 'Retrieved document: \n\n {document} \n\n User question: {question}'),
+            ('system', """You are a document grader. For each document, decide if it's relevant.
+            Return a JSON Array with the format defined below:
+            [
+                {{"doc_id": 1, "relevant": true}},
+                {{"doc_id": 2, "relevant": false}}
+            ]
+            Use double braces in the response.
+            """),
+            ('human', 'Question: {question}\n\nDocuments:\n{docs_text}'),
         ])
         grader_chain = prompt | self.llm | StrOutputParser()
-        filtered_docs = []
-        for d in documents:
-            try: # try-except block in case of garbage json output
-                score = grader_chain.invoke({'question': question, 'document': d.page_content})
-                if "yes" in score.lower():
-                    filtered_docs.append(d)
-            except:
-                continue
-        return {'context': filtered_docs}
+        try:
+            result = grader_chain.invoke({'question': question, 'docs_text': docs_text})
+            scores = json.loads(result)
+            score_map = {item['doc_id']: item.get('relevant', False) for item in scores}    
+            filtered_docs = [
+                doc for i, doc in enumerate(documents) 
+                if score_map.get(i + 1, False) # default to False (remove) if LLM didn't mention it
+            ]
+            
+            print(f"Filtered: {len(filtered_docs)}/{len(documents)} relevant")
+            return {'context': filtered_docs}
+        except Exception as e:
+            print(f'Grading failed: {e}')
+            return {'context': documents}
     
     def _transform_query(self, state: State):
         """
@@ -234,19 +255,25 @@ class Chatbot:
         return {"question": reformulated_question}
     
     def _create_workflow(self) -> CompiledStateGraph:
-        graph_builder = StateGraph(State).add_sequence([self._condense_question, self._retrieve, self._grade_documents])
-        graph_builder.add_node('_transform_query', self._transform_query)
-        graph_builder.add_node('_generate', self._generate)
-        graph_builder.add_edge(START, '_condense_question')
-        graph_builder.add_conditional_edges(
-            '_grade_documents', self._decide_to_generate,
-            {
-                '_transform_query': '_transform_query',
-                '_generate': '_generate'
-            },
-        )
-        graph_builder.add_edge('_transform_query', '_retrieve')
-        graph_builder.add_edge('_generate', END)
+        graph_builder = StateGraph(State)
+        if not Config.Chatbot.GRADING_MODE:
+            graph_builder.add_sequence([self._condense_question, self._retrieve, self._generate])
+            graph_builder.add_edge(START, '_condense_question')
+            graph_builder.add_edge('_generate', END)
+        else:
+            graph_builder.add_sequence([self._condense_question, self._retrieve, self._grade_documents])
+            graph_builder.add_node('_transform_query', self._transform_query)
+            graph_builder.add_node('_generate', self._generate)
+            graph_builder.add_edge(START, '_condense_question')
+            graph_builder.add_conditional_edges(
+                '_grade_documents', self._decide_to_generate,
+                {
+                    '_transform_query': '_transform_query',
+                    '_generate': '_generate'
+                },
+            )
+            graph_builder.add_edge('_transform_query', '_retrieve')
+            graph_builder.add_edge('_generate', END)
         return graph_builder.compile()
 
     def _ask_model(
