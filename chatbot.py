@@ -17,6 +17,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.callbacks import StreamingStdOutCallbackHandler
 import json
 import re
+from query_scoring import QueryScorer
 
 close_tag = '</think>'
 tag_length = len(close_tag)
@@ -34,7 +35,9 @@ class State(TypedDict):
     chat_history: List[BaseMessage]
     context: List[Document]
     answer: str
-    retry_count: int 
+    retry_count: int
+    sub_questions: List[str]  
+    confidence: dict          
 
 class QueryType(Enum):
     STANDALONE = "standalone"       # new topic, search directly
@@ -75,6 +78,22 @@ FILE_TEMPLATE = """
     <content>{content}</content>
 </file>
 """.strip()
+
+DECOMPOSE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You decompose complex questions into 2-3 simpler, standalone sub-questions.
+
+RULES:
+- Output JSON array of strings
+- Each item must be a complete question ending with '?'
+- Do NOT answer, only decompose
+- If question is simple, return a single-item array with the original question
+
+Example:
+Input: "Compare the values in Table 2 and Table 3 and explain differences."
+Output: ["What are the values in Table 2?", "What are the values in Table 3?", "What are the key differences between Table 2 and Table 3?"]
+"""),
+    ("human", "{question}"),
+])
 
 HYDE_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are a technical document author. Given a question, write a short paragraph (3-5 sentences) that would appear in a document answering this question.
@@ -132,6 +151,10 @@ class SourcesEvent:
 class FinalAnswerEvent:
     content: str
 
+@dataclass
+class ConfidenceEvent:
+    content: dict
+
 def _remove_thinking_from_message(message: str) -> str:
     # handle cases where the tag might not exist
     if close_tag in message:
@@ -156,6 +179,7 @@ class Chatbot:
                             streaming=True,
                             callbacks=[StreamingStdOutCallbackHandler()])
         self.workflow = self._create_workflow()
+        self.query_scorer = QueryScorer() if Config.Chatbot.ENABLE_CONFIDENCE_SCORING else None
 
     def _format_docs(self, docs: List[Document], max_chars_per_doc: int = 2000) -> str:
         """
@@ -189,14 +213,106 @@ class Chatbot:
     #     return "\n\n".join(FILE_TEMPLATE.format(name=doc.metadata['source'], content=doc.page_content) for doc in docs)
     
     def _retrieve(self, state: State):
-        print(f"RETRIEVING: {state['question']}")
-        context = self.retriever.invoke(state['question'])
+        question = state['question']
+        print(f"RETRIEVING: {question}")
+
+        # Decompose query (optional)
+        sub_questions = self._decompose_question(question)
+
+        # Retrieve with each sub-question
+        all_docs = []
+        seen = set()
+        for q in sub_questions:
+            docs = self.retriever.invoke(q)
+            for doc in docs:
+                key = doc.page_content[:200]
+                if key not in seen:
+                    all_docs.append(doc)
+                    seen.add(key)
+
+        context = all_docs
+
+        # parent expansion
         if Config.Preprocessing.ENABLE_PARENT_CHILD:
             original_count = len(context)
             context = expand_to_parents(context)
             print(f"  Expanded {original_count} children → {len(context)} parents")
-        
-        return {"context": context}
+
+        # contextual compression
+        if getattr(Config.Chatbot, 'ENABLE_CONTEXTUAL_COMPRESSION', False):
+            from contextual_compressor import get_compressor
+            compressor = get_compressor()
+            context = compressor.compress(context, question)
+
+        # confidence scoring (added below)
+        confidence = None
+        if getattr(Config.Chatbot, 'ENABLE_QUERY_SCORING', False) and self.query_scorer:
+            score = self.query_scorer.score(question, context)
+            confidence = {
+                "score": score.score,
+                "semantic": score.semantic,
+                "lexical": score.lexical,
+                "label": score.label,
+                "num_docs": score.num_docs,
+            }
+
+        if getattr(Config.Chatbot, 'ENABLE_CONTEXTUAL_COMPRESSION', False):
+            from contextual_compressor import get_compressor
+            compressor = get_compressor()
+            context = compressor.compress(context, question)
+
+        return {
+            "context": context,
+            "sub_questions": sub_questions,
+            "confidence": confidence,
+        }
+
+    def _is_complex_query(self, question: str) -> bool:
+        """
+        Heuristic for detecting complex/multi-hop queries
+        """
+        if len(question.split()) < Config.Chatbot.DECOMPOSE_MIN_WORDS:
+            return False
+        keywords = ["compare", "difference", "between", "versus", "vs", "both", "and", "contrast", "relative"]
+        return any(k in question.lower() for k in keywords)
+
+    def _decompose_question(self, question: str) -> List[str]:
+        """
+        Use LLM to break question into sub-questions
+        """
+        if not Config.Chatbot.ENABLE_QUERY_DECOMPOSITION:
+            return [question]
+
+        if not self._is_complex_query(question):
+            return [question]
+
+        try:
+            chain = DECOMPOSE_PROMPT | self.llm | StrOutputParser()
+            raw = chain.invoke({"question": question})
+
+            # clean thinking tags
+            if '</think>' in raw:
+                raw = raw.split('</think>')[-1].strip()
+
+            # parse JSON array
+            import json
+            sub_questions = json.loads(raw)
+
+            # sanitize
+            cleaned = []
+            for q in sub_questions:
+                q = q.strip()
+                if not q.endswith('?'):
+                    q += '?'
+                cleaned.append(q)
+
+            # remove duplicates & limit
+            unique = list(dict.fromkeys(cleaned))
+            return unique[:Config.Chatbot.DECOMPOSE_MAX_SUBQUESTIONS]
+
+        except Exception as e:
+            print(f"Decomposition failed: {e}")
+        return [question]
 
     def _hyde_retrieve(self, state: State):
         """
@@ -237,9 +353,15 @@ class Chatbot:
             
             # limit to configured max
             merged = merged[:Config.Chatbot.N_CONTEXT_RESULTS * 2]
-            
+
             print(f"   HyDE retrieved {len(context)} + normal {len(normal_context)} = {len(merged)} unique docs")
-            
+
+            # apply contextual compression if enabled
+            if getattr(Config.Chatbot, 'ENABLE_CONTEXTUAL_COMPRESSION', False):
+                from contextual_compressor import get_compressor
+                compressor = get_compressor()
+                merged = compressor.compress(merged, question)
+
             return {"context": merged}
             
         except Exception as e:
@@ -521,7 +643,10 @@ Output: A symmetric matrix A is positive semidefinite if x^T A x >= 0 for all x.
                         yield ChunkEvent(chunk.content)
             if event_type == 'updates':
                 if "_retrieve" in event_data:
-                    documents = event_data['_retrieve']['context']
+                    payload = event_data["_retrieve"]
+                    documents = payload["context"]
+
+                    # existing dedupe logic
                     unique_docs = []
                     seen_content = set()
                     for doc in documents:
@@ -529,6 +654,11 @@ Output: A symmetric matrix A is positive semidefinite if x^T A x >= 0 for all x.
                             unique_docs.append(doc)
                             seen_content.add(doc.page_content)
                     yield SourcesEvent(unique_docs)
+
+                    # confidence event
+                    confidence = payload.get("confidence")
+                    if confidence:
+                        yield ConfidenceEvent(confidence)
                 if "_generate" in event_data:
                     answer = event_data['_generate']['answer']
                     yield FinalAnswerEvent(answer.content)
