@@ -18,6 +18,8 @@ import re
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+from langchain_core.output_parsers import StrOutputParser
+
 
 def reciprocal_rank_fusion(
     results_lists: List[List[Document]],
@@ -116,8 +118,48 @@ text_splitter = RecursiveCharacterTextSplitter(
     chunk_overlap = Config.Preprocessing.CHUNK_OVERLAP
 )
 
-# def create_llm() -> ChatOllama:
-#     return ChatOllama(model=Config.Preprocessing.LLM, temperature=0, keep_alive=-1)
+def create_llm() -> ChatOllama:
+    """Create LLM for context generation"""
+    return ChatOllama(
+        model=Config.Model.NAME,
+        temperature=0,
+        num_ctx=4096,
+        num_predict=256,
+        keep_alive=-1,
+    )
+
+def _generate_context(llm: ChatOllama, document: str, chunk: str) -> str:
+    """
+    Generate contextual information for a chunk using LLM.
+    This implements Anthropic's contextual retrieval technique.
+
+    Args:
+        llm: Language model for generation
+        document: Full document text (or large portion)
+        chunk: Specific chunk to contextualize
+
+    Returns:
+        2-3 sentence context describing the chunk's role in document
+    """
+    try:
+        # Truncate document if too long
+        doc_preview = document[:3000] if len(document) > 3000 else document
+
+        chain = CONTEXT_PROMPT | llm | StrOutputParser()
+        context = chain.invoke({
+            'document': doc_preview,
+            'chunk': chunk[:800]  # Limit chunk size for prompt
+        })
+
+        # Clean thinking tags if present
+        if '</think>' in context:
+            context = context.split('</think>')[-1].strip()
+
+        return context.strip()
+
+    except Exception as e:
+        print(f"    Context generation failed: {e}")
+        return ""
 
 def create_reranker():
     """
@@ -274,7 +316,7 @@ def _delete_chunks_by_source(vector_store: Chroma, source_name: str):
     except Exception as e:
         print(f"Warning: Could not delete old chunks for {source_name}: {e}")
 
-def _create_chunks_from_blocks(file: File, file_hash: str) -> List[Document]:
+def _create_chunks_from_blocks(file: File, file_hash: str, llm=None) -> List[Document]:
     """
     Create chunks from structured ContentBlocks, preserving page/type metadata.
     Falls back to text-based chunking if no blocks available.
@@ -282,13 +324,16 @@ def _create_chunks_from_blocks(file: File, file_hash: str) -> List[Document]:
     # fallback: if no content_blocks, use old text-based approach
     if not file.content_blocks:
         doc = Document(
-            file.content, 
+            file.content,
             metadata={'source': file.name, 'content_hash': file_hash}
         )
         return _create_chunks(doc)
     
     chunks = []
-    
+
+    # Get full document content for contextualization
+    full_document = file.content if Config.Preprocessing.CONTEXTUALIZE_CHUNKS else None
+
     for block in file.content_blocks:
         base_metadata = {
             'source': file.name,
@@ -296,8 +341,8 @@ def _create_chunks_from_blocks(file: File, file_hash: str) -> List[Document]:
             'page': block.page_num,
             'content_type': block.content_type,
         }
-        
-                # keep as single chunk with table_data 
+
+        # keep as single chunk with table_data
         if block.content_type == 'table':
             # serialize table_data to JSON string 
             table_data_json = None
@@ -347,15 +392,24 @@ def _create_chunks_from_blocks(file: File, file_hash: str) -> List[Document]:
                 metadata=base_metadata,
             ))
         
-        # TEXT: split if large 
+        # TEXT: split if large
         else:
             text = block.content.strip()
             if not text:
                 continue
-            
+
             if len(text) <= Config.Preprocessing.CHUNK_SIZE:
+                chunk_content = text
+
+                # Add contextual information if enabled
+                if Config.Preprocessing.CONTEXTUALIZE_CHUNKS and llm and full_document:
+                    context = _generate_context(llm, full_document, text)
+                    if context:
+                        chunk_content = f"{context}\n\n{text}"
+                        base_metadata['contextualized'] = True
+
                 chunks.append(Document(
-                    page_content=text,
+                    page_content=chunk_content,
                     metadata=base_metadata,
                 ))
             else:
@@ -364,11 +418,23 @@ def _create_chunks_from_blocks(file: File, file_hash: str) -> List[Document]:
                     [text],
                     metadatas=[base_metadata]
                 )
-                chunks.extend(sub_chunks)
-    
+
+                # Add context to each sub-chunk if enabled
+                if Config.Preprocessing.CONTEXTUALIZE_CHUNKS and llm and full_document:
+                    contextualized_chunks = []
+                    for sub_chunk in sub_chunks:
+                        context = _generate_context(llm, full_document, sub_chunk.page_content)
+                        if context:
+                            sub_chunk.page_content = f"{context}\n\n{sub_chunk.page_content}"
+                            sub_chunk.metadata['contextualized'] = True
+                        contextualized_chunks.append(sub_chunk)
+                    chunks.extend(contextualized_chunks)
+                else:
+                    chunks.extend(sub_chunks)
+
     return chunks
 
-def _create_parent_child_chunks(file: File, file_hash: str) -> tuple[List[Document], List[Document]]:
+def _create_parent_child_chunks(file: File, file_hash: str, llm=None) -> tuple[List[Document], List[Document]]:
     """
     Create parent-child chunk pairs for improved retrieval.
     """
@@ -385,6 +451,7 @@ def _create_parent_child_chunks(file: File, file_hash: str) -> tuple[List[Docume
     
     parent_chunks = []
     child_chunks = []
+    full_document = file.content if Config.Preprocessing.CONTEXTUALIZE_CHUNKS else None
     
     # create parent chunks from content blocks
     if not file.content_blocks:
@@ -443,6 +510,7 @@ def _create_parent_child_chunks(file: File, file_hash: str) -> tuple[List[Docume
                 }
             )
             child_chunks.append(child)
+            continue
         else:
             # text: split into smaller children
             if len(parent.page_content) > Config.Preprocessing.CHILD_CHUNK_SIZE:
@@ -454,14 +522,32 @@ def _create_parent_child_chunks(file: File, file_hash: str) -> tuple[List[Docume
                         'is_parent': False,
                     }]
                 )
+
+                # add contextualization to children (if enabled)
+                if Config.Preprocessing.CONTEXTUALIZE_CHUNKS and llm and full_document:
+                    for child in children:
+                        context = _generate_context(llm, full_document, child.page_content)
+                        if context:
+                            child.page_content = f"{context}\n\n{child.page_content}"
+                            child.metadata['contextualized'] = True
+
                 child_chunks.extend(children)
+
             else:
+                child_content = parent.page_content
+
+                if Config.Preprocessing.CONTEXTUALIZE_CHUNKS and llm and full_document:
+                    context = _generate_context(llm, full_document, child_content)
+                    if context:
+                        child_content = f"{context}\n\n{child_content}"
+
                 child_chunks.append(Document(
-                    page_content=parent.page_content,
+                    page_content=child_content,
                     metadata={
                         **parent.metadata,
                         'parent_id': parent_id,
                         'is_parent': False,
+                        'contextualized': Config.Preprocessing.CONTEXTUALIZE_CHUNKS
                     }
                 ))
     
@@ -563,10 +649,56 @@ class ParentChildRetriever(BaseRetriever):
         return self._get_relevant_documents(query, **kwargs)
 
 
+class CachedRetriever(BaseRetriever):
+    """
+    Retriever wrapper that adds semantic query caching.
+    """
+    base_retriever: BaseRetriever
+    embedding_model: any = None
+    cache: any = None
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    def _get_query_embedding(self, query: str):
+        """Get embedding for query (used as cache key)"""
+        if self.embedding_model is None:
+            self.embedding_model = create_embeddings()
+        return self.embedding_model.embed_query(query)
+
+    def _get_relevant_documents(self, query: str, **kwargs) -> List[Document]:
+        """Retrieve with caching"""
+        from config import Config as AppConfig
+        import numpy as np
+
+        if not AppConfig.Performance.ENABLE_QUERY_CACHE:
+            return self.base_retriever.invoke(query)
+
+        # Initialize cache on first use
+        if self.cache is None:
+            from query_cache import get_cache
+            self.cache = get_cache()
+
+        # Get query embedding for cache lookup
+        query_embedding = np.array(self._get_query_embedding(query))
+
+        # Try cache first
+        cached_docs = self.cache.get(query, query_embedding)
+        if cached_docs is not None:
+            return cached_docs
+
+        # Cache miss - retrieve and store
+        docs = self.base_retriever.invoke(query)
+        self.cache.put(query, query_embedding, docs)
+
+        return docs
+
+    async def _aget_relevant_documents(self, query: str, **kwargs) -> List[Document]:
+        return self._get_relevant_documents(query, **kwargs)
+
+
 class MultiQueryRetriever(BaseRetriever):
     """
     Generates multiple query variations and retrieves with all of them.
-    Lighter and faster than HyDE, better for cross-domain retrieval.
     """
     base_retriever: BaseRetriever
     llm: any = None
@@ -585,7 +717,7 @@ class MultiQueryRetriever(BaseRetriever):
                 temperature=0.3,
                 num_ctx=1024,
                 num_predict=150,
-                keep_alive=0,
+                keep_alive=-1,
             )
 
         prompt = ChatPromptTemplate.from_template(
@@ -646,8 +778,14 @@ Alternatives:"""
 def ingest_files(files: List[File]) -> BaseRetriever:
     """
     Ingests into a Persistent Vector Database (Chroma)
-    Enhanced with table intelligence
+    Enhanced with table intelligence, contextual embeddings, and semantic caching
     """
+    # initialize LLM for contextual embeddings
+    llm = None
+    if Config.Preprocessing.CONTEXTUALIZE_CHUNKS:
+        print("Initializing LLM for contextual chunk embeddings...")
+        llm = create_llm()
+
     # initialize embeddings
     embedding_model = create_embeddings()
 
@@ -700,14 +838,14 @@ def ingest_files(files: List[File]) -> BaseRetriever:
 
         # use parent-child chunking if enabled
         if Config.Preprocessing.ENABLE_PARENT_CHILD:
-            child_chunks, parent_chunks = _create_parent_child_chunks(f, file_hash)
+            child_chunks, parent_chunks = _create_parent_child_chunks(f, file_hash, llm)
             _build_parent_store(parent_chunks)
             # Store BOTH children and parents in Chroma
             # Children are used for retrieval, parents for expansion
             file_chunks = child_chunks + parent_chunks
             print(f"  Created {len(child_chunks)} children, {len(parent_chunks)} parents")
         else:
-            file_chunks = _create_chunks_from_blocks(f, file_hash)
+            file_chunks = _create_chunks_from_blocks(f, file_hash, llm)
 
         # count tables
         table_chunks = sum(1 for c in file_chunks if c.metadata.get('content_type') == 'table')
@@ -790,9 +928,20 @@ def ingest_files(files: List[File]) -> BaseRetriever:
         final_retriever = ensemble_retriever
     reranker = create_reranker()
     if reranker is None:
-        return final_retriever
-    
-    return ContextualCompressionRetriever(
-        base_compressor=reranker,
-        base_retriever=final_retriever
-    )
+        retriever_with_cache = final_retriever
+    else:
+        retriever_with_cache = ContextualCompressionRetriever(
+            base_compressor=reranker,
+            base_retriever=final_retriever
+        )
+
+    # Wrap with semantic caching (outermost layer)
+    if Config.Performance.ENABLE_QUERY_CACHE:
+        print("Enabling semantic query caching")
+        cached_retriever = CachedRetriever(
+            base_retriever=retriever_with_cache,
+            embedding_model=embedding_model 
+        )
+        return cached_retriever
+
+    return retriever_with_cache
