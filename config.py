@@ -22,7 +22,7 @@ class Config:
     DEVICE = get_device()
 
     class Model:
-            NAME = 'qwen3:4b-instruct'
+            NAME = 'qwen3:4b-instruct'  # Fast for user-facing responses
             TEMPERATURE = 0.1
 
     class Preprocessing:
@@ -33,7 +33,7 @@ class Config:
         CONTEXTUALIZE_CHUNKS = False
         N_SEMANTIC_RESULTS = 6
         N_BM25_RESULTS = 6
-        ENABLE_PARENT_CHILD = True
+        ENABLE_PARENT_CHILD = False
         PARENT_CHUNK_SIZE = 2048  # larger chunks for LLM context
         CHILD_CHUNK_SIZE = 256    # smaller chunks for precise retrieval
         USE_RRF = True  # use Reciprocal Rank Fusion 
@@ -44,14 +44,24 @@ class Config:
         GRADING_MODE = False
         ENABLE_QUERY_ROUTER = True
         ROUTER_HISTORY_WINDOW = 4
-        ENABLE_HYDE = False  
-        ENABLE_MULTI_QUERY = True   
+        ENABLE_HYDE = False
+        ENABLE_MULTI_QUERY = False
+        ENABLE_CONTEXTUAL_COMPRESSION = True  # extract relevant portions from retrieved docs   
+        ENABLE_QUERY_DECOMPOSITION = True
+        DECOMPOSE_MAX_SUBQUESTIONS = 3
+        DECOMPOSE_MIN_WORDS = 10
+        ENABLE_QUERY_SCORING = True
 
     class Eval:
         """Evaluation settings"""
         GOLD_SET_PATH = "eval/gold_set.json"
         K = 4  # recall@k
         OUTPUT_DIR = "eval/results"
+        ENABLE_LLM_JUDGE = True
+        JUDGE_MODEL = "qwen3:4b-thinking"  # Model for LLM-as-judge evaluation
+        JUDGE_TEMPERATURE = 0
+        FAITHFULNESS_THRESHOLD = 0.7
+        HALLUCINATION_THRESHOLD = 0.4 
 
     class Path:
         APP_HOME = Path(os.getenv("APP_HOME", Path(__file__).parent.parent))
@@ -68,6 +78,9 @@ class Config:
          ENABLE_QUERY_CACHE = True
          CACHE_TTL_SECONDS = 3600
          CLEAR_GPU_AFTER_INDEXING = True
+         CACHE_SIMILARITY_THRESHOLD = 0.95
+         CACHE_MAX_SIZE = 1000
+         CACHE_EVICT_EVERY = 100
 
     
         
