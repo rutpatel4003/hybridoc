@@ -1,0 +1,236 @@
+{
+  "version": "1.0",
+  "description": "Gold set for Private-RAG evaluation using 'Attention Is All You Need' (Vaswani et al., 2017)",
+  "source_document": {
+    "name": "1706.03762v7.pdf",
+    "url": "https://arxiv.org/pdf/1706.03762.pdf",
+    "pages": 15
+  },
+  "questions": [
+    {
+      "id": "txt_1",
+      "question": "What is the main contribution of the Transformer architecture?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [1, 2],
+      "expected_content_type": "text",
+      "keywords": ["attention", "recurrence", "convolutions", "self-attention"],
+      "difficulty": "easy"
+    },
+    {
+      "id": "txt_2",
+      "question": "What are the three ways attention is used in the Transformer?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [5],
+      "expected_content_type": "text",
+      "keywords": ["encoder-decoder", "self-attention", "encoder", "decoder"],
+      "difficulty": "medium"
+    },
+    {
+      "id": "txt_3",
+      "question": "Why did the authors choose self-attention over recurrent layers?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [6],
+      "expected_content_type": "text",
+      "keywords": ["computational complexity", "parallelization", "path length", "sequential"],
+      "difficulty": "medium"
+    },
+    {
+      "id": "txt_4",
+      "question": "What is the formula for scaled dot-product attention?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [4],
+      "expected_content_type": "text",
+      "keywords": ["softmax", "sqrt", "QK", "dot-product"],
+      "difficulty": "medium"
+    },
+    {
+      "id": "txt_5",
+      "question": "What regularization techniques were used during training?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [7, 8],
+      "expected_content_type": "text",
+      "keywords": ["dropout", "label smoothing", "residual"],
+      "difficulty": "medium"
+    },
+    {
+      "id": "txt_6",
+      "question": "How does positional encoding work in the Transformer?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [5, 6],
+      "expected_content_type": "text",
+      "keywords": ["sine", "cosine", "positional", "encoding", "position"],
+      "difficulty": "medium"
+    },
+    {
+      "id": "txt_7",
+      "question": "What optimizer was used to train the Transformer?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [7],
+      "expected_content_type": "text",
+      "keywords": ["Adam", "optimizer", "beta", "learning rate"],
+      "difficulty": "easy"
+    },
+    {
+      "id": "txt_8",
+      "question": "What is multi-head attention and why is it useful?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [4, 5],
+      "expected_content_type": "text",
+      "keywords": ["multi-head", "heads", "subspaces", "jointly", "different positions"],
+      "difficulty": "medium"
+    },
+    {
+      "id": "txt_9",
+      "question": "What datasets were used for training the translation models?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [7],
+      "expected_content_type": "text",
+      "keywords": ["WMT", "2014", "English-German", "English-French", "sentence pairs"],
+      "difficulty": "easy"
+    },
+    {
+      "id": "txt_10",
+      "question": "How long did it take to train the base Transformer model?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [7, 8],
+      "expected_content_type": "text",
+      "keywords": ["12 hours", "100,000 steps", "P100", "GPUs"],
+      "difficulty": "medium"
+    },
+    {
+      "id": "tbl_1",
+      "question": "What BLEU score did the Transformer achieve on English-to-German translation?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [8],
+      "expected_content_type": "table",
+      "keywords": ["28.4", "BLEU", "EN-DE", "English-German"],
+      "difficulty": "easy"
+    },
+    {
+      "id": "tbl_2",
+      "question": "What is the model dimension (d_model) in the base Transformer?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [8, 9],
+      "expected_content_type": "table",
+      "keywords": ["512", "d_model", "dimension"],
+      "difficulty": "easy"
+    },
+    {
+      "id": "tbl_3",
+      "question": "How many attention heads are used in the base model?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [8, 9],
+      "expected_content_type": "table",
+      "keywords": ["8", "heads", "h"],
+      "difficulty": "easy"
+    },
+    {
+      "id": "tbl_4",
+      "question": "What is the feed-forward dimension (d_ff) in the Transformer?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [8, 9],
+      "expected_content_type": "table",
+      "keywords": ["2048", "d_ff", "feed-forward"],
+      "difficulty": "easy"
+    },
+    {
+      "id": "tbl_5",
+      "question": "How does the Transformer compare to previous state-of-the-art on English-French translation?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [8],
+      "expected_content_type": "table",
+      "keywords": ["41.0", "41.8", "BLEU", "EN-FR", "state-of-the-art"],
+      "difficulty": "medium"
+    },
+    {
+      "id": "tbl_6",
+      "question": "What dropout rate was used in the base Transformer model?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [8, 9],
+      "expected_content_type": "table",
+      "keywords": ["0.1", "dropout", "P_drop"],
+      "difficulty": "easy"
+    },
+    {
+      "id": "tbl_7",
+      "question": "What is the training cost comparison between Transformer and other models in FLOPs?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [8],
+      "expected_content_type": "table",
+      "keywords": ["FLOPs", "training cost", "10^18"],
+      "difficulty": "hard"
+    },
+    {
+      "id": "tbl_8",
+      "question": "How many encoder and decoder layers are in the base Transformer?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [8, 9],
+      "expected_content_type": "table",
+      "keywords": ["6", "layers", "N", "encoder", "decoder"],
+      "difficulty": "easy"
+    },
+    {
+      "id": "tbl_9",
+      "question": "What label smoothing value was used during training?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [8],
+      "expected_content_type": "table",
+      "keywords": ["0.1", "label smoothing", "epsilon"],
+      "difficulty": "medium"
+    },
+    {
+      "id": "tbl_10",
+      "question": "What is the difference in parameters between the base and big Transformer models?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [8, 9],
+      "expected_content_type": "table",
+      "keywords": ["65", "213", "million", "parameters"],
+      "difficulty": "hard"
+    },
+    {
+      "id": "arch_1",
+      "question": "What are the main components of the Transformer encoder?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [2, 3],
+      "expected_content_type": "text",
+      "keywords": ["multi-head attention", "feed-forward", "layer normalization", "residual"],
+      "difficulty": "medium"
+    },
+    {
+      "id": "arch_2",
+      "question": "How does masking work in the decoder's self-attention?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [3, 5],
+      "expected_content_type": "text",
+      "keywords": ["mask", "illegal", "future positions", "-infinity", "autoregressive"],
+      "difficulty": "hard"
+    },
+    {
+      "id": "ablation_1",
+      "question": "What happens to performance when you vary the number of attention heads?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [9],
+      "expected_content_type": "table",
+      "keywords": ["heads", "quality", "single-head", "too many"],
+      "difficulty": "hard"
+    },
+    {
+      "id": "ablation_2",
+      "question": "How does reducing the attention key dimension affect the model?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [9],
+      "expected_content_type": "table",
+      "keywords": ["d_k", "key", "dimension", "quality", "dot product"],
+      "difficulty": "hard"
+    },
+    {
+      "id": "parsing_1",
+      "question": "How well did the Transformer perform on English constituency parsing?",
+      "expected_sources": ["1706.03762"],
+      "expected_pages": [10],
+      "expected_content_type": "text",
+      "keywords": ["parsing", "WSJ", "F1", "91.3", "constituency"],
+      "difficulty": "medium"
+    }
+  ]
+}
