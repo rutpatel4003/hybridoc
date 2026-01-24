@@ -203,6 +203,37 @@ class TableExtractor:
         output.append("END TABLE")
 
         return "\n".join(output)
+
+    @staticmethod
+    def detect_figure(text: str) -> bool:
+        """
+        Detect if OCR text represents a figure/diagram (not a table).
+        """
+        text_lower = text.lower()
+        
+        # positive indicators of figure content
+        figure_indicators = [
+            r'figure\s+\d+',
+            r'fig\.\s*\d+',
+            r'diagram',
+            r'illustration',
+            r'architecture',
+            r'→|←|↑|↓',  # arrows common in diagrams
+            r'input.*output',
+            r'layer\s*\d+',
+            r'\bx_\d+\b|\by_\d+\b',  # mathematical notation
+        ]
+        
+        for pattern in figure_indicators:
+            if re.search(pattern, text_lower):
+                return True
+        
+        # if text is short and doesn't look like a table, it's likely a figure
+        lines = text.strip().split('\n')
+        if len(lines) < 3 and len(text) < 200:
+            return True
+        
+        return False
     
 class TableQueryHelper:
     """
@@ -257,6 +288,7 @@ class TableQueryHelper:
             if any(query_lower in str(value).lower() for value in r.values()):
                 matching_rows.append(r)
         return matching_rows
+
 
             
     

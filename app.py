@@ -3,7 +3,7 @@ from typing import List
 import streamlit as st
 from streamlit.runtime.uploaded_file_manager import UploadedFile
 from chatbot import Chatbot, ChunkEvent, Message, Role, SourcesEvent, create_history
-from pdf_loader import load_uploaded_file, cleanup_got_model
+from pdf_loader import load_uploaded_file, cleanup_ocr_model
 import time
 import pandas as pd
 import json
@@ -44,7 +44,7 @@ def get_file_cache_key(files: List[UploadedFile]) -> str:
 def create_chatbot_cached(cache_key: str, files: List[UploadedFile]):
     """Create chatbot with proper caching"""
     files = [load_uploaded_file(f) for f in files]
-    cleanup_got_model()
+    cleanup_ocr_model()
     return Chatbot(files)
 
 def show_uploaded_documents() -> List[UploadedFile]:
@@ -107,16 +107,12 @@ def render_source_content(doc, source_idx: int):
     source_name = doc.metadata.get('source', 'Unknown')
     content_type = doc.metadata.get('content_type', 'text')
     page_num = doc.metadata.get('page', None)
-    
-    # --- FIX START: Decode JSON Strings ---
-    # ChromaDB returns metadata as strings, we must parse them back to dicts
     table_data = doc.metadata.get('table_data')
     if isinstance(table_data, str):
         try:
             table_data = json.loads(table_data)
         except json.JSONDecodeError:
             table_data = None
-    # --- FIX END ---
 
     # build title
     title_parts = [f"📄 {source_name}"]
@@ -136,19 +132,15 @@ def render_source_content(doc, source_idx: int):
     with st.expander(title, expanded=(source_idx == 0)):
         # show metadata
         col1, col2 = st.columns([3, 1])
-        
         with col1:
             st.caption(f"*Source: {source_name}*")
-        
         with col2:
             if content_type == 'table' and table_data:
                 st.caption(f"📊 {table_data.get('num_rows', 0)} rows")
-        
         # render content based on type
         if content_type == 'table':
             if table_data:
                 st.markdown("**📊 Interactive Table:**")
-                
                 # try to render as interactive table
                 if render_table_from_metadata(table_data):
                     # show raw markdown in collapsible section
@@ -159,7 +151,6 @@ def render_source_content(doc, source_idx: int):
                     st.markdown(doc.page_content)
             else:
                 st.markdown(doc.page_content)
-        
         elif content_type == 'figure':
             st.markdown("**🖼️ Figure/Formula Content:**")
             # display in a code block for better formatting of LaTeX/formulas
@@ -167,7 +158,6 @@ def render_source_content(doc, source_idx: int):
                 st.latex(doc.page_content)
             else:
                 st.markdown(doc.page_content)
-        
         else:  
             content = doc.page_content
             # show preview if content is long
@@ -192,60 +182,50 @@ if "messages" not in st.session_state:
 # sidebar with file info
 with st.sidebar:
     st.title("📁 Your Files")
-    
     for file in chatbot.files:
         st.markdown(f"**{file.name}**")
-        
         # show content blocks info if available
         if file.content_blocks:
             tables = sum(1 for b in file.content_blocks if b.content_type == 'table')
             figures = sum(1 for b in file.content_blocks if b.content_type == 'figure')
-            
             if tables > 0 or figures > 0:
                 st.caption(f"📊 {tables} tables · 🖼️ {figures} figures")
-        
         st.markdown("---")
-    
     st.info("💡 Tip: Ask questions about specific table data, like 'What is the price in row 3?' or 'Compare values in the table'")
-
 # display chat history
 for message in st.session_state.messages:
     avatar = "🧑‍💻" if message.role == Role.USER else "🤖"
     with st.chat_message(message.role.value, avatar=avatar):
         st.markdown(message.content)
-
 # handle new user input
 if prompt := st.chat_input("Ask about your documents (including tables)..."):
+    # add user message to history immediately
+    st.session_state.messages.append(Message(role=Role.USER, content=prompt))
+
     with st.chat_message('user', avatar='🧑‍💻'):
         st.markdown(prompt)
-
     with st.chat_message('assistant', avatar='🤖'):
-        # Create layout
+        # create layout
         status_placeholder = st.empty()
-        
         metrics_cols = st.columns(4)
         retrieval_time_metric = metrics_cols[0].empty()
         docs_retrieved_metric = metrics_cols[1].empty()
         docs_relevant_metric = metrics_cols[2].empty()
         confidence_metric = metrics_cols[3].empty()
-        
-        # Sources section
+        # sources section
         st.markdown("---")
         sources_header = st.empty()
         sources_container = st.container()
-        
-        # Answer section
+        # answer section
         st.markdown("---")
         answer_header = st.empty()
         message_placeholder = st.empty()
-        
-        # Initialize tracking
+        # initialize tracking
         status_placeholder.status(random.choice(LOADING_MESSAGES), state='running')
         full_response = ''
         sources_shown = False
         start_time = time.time()
         num_sources = 0
-        
         for event in chatbot.ask(prompt, st.session_state.messages):
             if isinstance(event, ConfidenceEvent):
                 label = event.content.get("label", "unknown").title()
@@ -262,7 +242,6 @@ if prompt := st.chat_input("Ask about your documents (including tables)..."):
                 
                 if not sources_shown and event.content:
                     sources_shown = True
-                    
                     # count content types
                     tables = sum(1 for d in event.content if d.metadata.get('content_type') == 'table')
                     figures = sum(1 for d in event.content if d.metadata.get('content_type') == 'figure')
@@ -272,7 +251,6 @@ if prompt := st.chat_input("Ask about your documents (including tables)..."):
                         header_text += f" (📊 {tables} tables, 🖼️ {figures} figures)"
                     
                     sources_header.markdown(header_text)
-                    
                     with sources_container:
                         # use tabs if many sources, expanders if few
                         if len(event.content) <= 3:
@@ -304,9 +282,24 @@ if prompt := st.chat_input("Ask about your documents (including tables)..."):
                     message_placeholder.markdown(full_response + "▌")
                     st.session_state.last_update_time = current_time
         
-        # final display
-        message_placeholder.markdown(full_response)
-        
+        # final display with parsed citations
+        if "sources:" in full_response:
+            # split answer and citations
+            parts = full_response.rsplit("sources:", 1)
+            answer_text = parts[0].strip()
+            citations_text = parts[1].strip()
+
+            # display answer
+            message_placeholder.markdown(answer_text)
+
+            # display citations as caption
+            st.caption(f"📚 sources: {citations_text}")
+        else:
+            message_placeholder.markdown(full_response)
+
+        # add assistant message to history after streaming completes
+        st.session_state.messages.append(Message(role=Role.ASSISTANT, content=full_response))
+
         # update final metrics
         if num_sources > 0:
             docs_relevant_metric.metric("✅ Relevant", num_sources)

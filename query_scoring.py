@@ -20,8 +20,8 @@ class QueryScorer:
     - Semantic similarity (query vs retrieved docs)
     - Lexical coverage (query keyword overlap)
     """
-    def __init__(self):
-        self.embedder = create_embeddings()
+    def __init__(self, embedder=None):
+        self.embedder = embedder or create_embeddings()
         self.top_k = Config.Chatbot.QUERY_SCORE_TOP_K
         self.weights = Config.Chatbot.QUERY_SCORE_WEIGHTS
         self.thresholds = Config.Chatbot.QUERY_SCORE_THRESHOLDS

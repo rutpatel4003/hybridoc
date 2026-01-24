@@ -18,6 +18,8 @@ from langchain_core.callbacks import StreamingStdOutCallbackHandler
 import json
 import re
 from query_scoring import QueryScorer
+from data_ingestor import create_embeddings
+
 
 close_tag = '</think>'
 tag_length = len(close_tag)
@@ -46,12 +48,20 @@ class QueryType(Enum):
     CHITCHAT = "chitchat" 
 
 SYSTEM_PROMPT = """
-You are a highly precise technical expert. Answer the question using ONLY the provided context.
-- START your answer immediately with the facts.
-- DO NOT use filler phrases like "Based on the context" or "According to the excerpts."
-- If the answer is not in the context, state: "Information not found in document."
-- Format math using LaTeX.
-- Do NOT use outside knowledge.
+You are a highly precise technical expert answering questions using ONLY the provided context.
+
+RULES:
+1. If the context contains relevant information:
+   - Provide a complete, direct answer
+   - Start immediately with facts (no filler like "Based on the context...")
+   - Format math with LaTeX ($$...$$)
+
+2. If the context does NOT contain relevant information:
+   - Respond with ONLY: "Information not found in document."
+   - Do NOT provide partial answers followed by "not found"
+
+3. NEVER mix both — either answer fully OR say information not found
+4. Do NOT use outside knowledge
 """.strip()
 
 PROMPT = """
@@ -172,14 +182,14 @@ class Chatbot:
         self.llm = ChatOllama(model=Config.Model.NAME,
                             temperature=Config.Model.TEMPERATURE,
                             num_ctx=4096,
-                            num_predict=1028, 
+                            num_predict=512, 
                             num_thread=8,      
                             verbose=False,
                             keep_alive=-1,
                             streaming=True,
                             callbacks=[StreamingStdOutCallbackHandler()])
         self.workflow = self._create_workflow()
-        self.query_scorer = QueryScorer() if Config.Chatbot.ENABLE_CONFIDENCE_SCORING else None
+        self.query_scorer = QueryScorer(embedder=create_embeddings()) if Config.Chatbot.ENABLE_QUERY_SCORING else None
 
     def _format_docs(self, docs: List[Document], max_chars_per_doc: int = 2000) -> str:
         """
@@ -189,14 +199,14 @@ class Chatbot:
         for doc in docs:
             content = doc.page_content
             
-            # Remove page markers
+            # remove page markers
             content = re.sub(r'--- PAGE \d+ ---', '', content)
             
-            # Clean context markers but keep the context text
+            # clean context markers but keep the context text
             content = content.replace('[CONTEXT]', '').replace('[/CONTEXT]', '')
             content = content.replace('[TABLE:', '[TABLE:').replace('[/TABLE]', '[/TABLE]')
             
-            # Truncate if too long
+            # truncate if too long
             if len(content) > max_chars_per_doc:
                 content = content[:max_chars_per_doc] + "\n[...truncated...]"
             
@@ -241,7 +251,7 @@ class Chatbot:
         # contextual compression
         if getattr(Config.Chatbot, 'ENABLE_CONTEXTUAL_COMPRESSION', False):
             from contextual_compressor import get_compressor
-            compressor = get_compressor()
+            compressor = get_compressor(llm=self.llm)
             context = compressor.compress(context, question)
 
         # confidence scoring (added below)
@@ -313,6 +323,15 @@ class Chatbot:
         except Exception as e:
             print(f"Decomposition failed: {e}")
         return [question]
+
+    def _is_explicit_question(self, text: str) -> bool:
+        """
+        Return True if the input is already a clear standalone question
+        """
+        text = text.strip() 
+        if not text.endswith('?'):
+            return False
+        return bool(re.search(r"\b(what|why|how|when|where|which|who|compare|difference|define|explain)\b", text.lower()))
 
     def _hyde_retrieve(self, state: State):
         """
@@ -414,17 +433,39 @@ class Chatbot:
         question = state['question']
         prompt = ChatPromptTemplate.from_messages([
             ("system", "You are generating a better search query for a vector database. Rephrase the input question to be more specific. Just rephrase the input question, do not add any preamble or explanation, your output should only contain the rephrased question, nothing else."),
-            ("human", f"Look at the input and try to reason about the underlying semantic intent / meaning. \n\n Initial Question: {question} \n\n Formulate an improved question: "),
+            ("human", "Look at the input and try to reason about the underlying semantic intent / meaning. \n\n Initial Question: {question} \n\n Formulate an improved question: "),
         ])
         chain = prompt | self.llm | StrOutputParser()
-        better_question = chain.invoke({})
+        better_question = chain.invoke({'question': question})
         current_retry = state.get('retry_count', 0)
         return {'question': better_question, 'retry_count': current_retry+1}
+
+    def _format_citations(self, docs: List[Document]) -> str:
+        """format citations from source documents"""
+        citations = []
+        seen = set()
+
+        for doc in docs[:3]:  # top 3 sources
+            source = doc.metadata.get('source', 'unknown')
+            page = doc.metadata.get('page', '?')
+            doc_title = doc.metadata.get('doc_title', source)
+
+            # use title if available, otherwise filename
+            display_name = doc_title if doc_title and doc_title != source else source
+            citation = f"{display_name}, p.{page}"
+
+            if citation not in seen:
+                citations.append(citation)
+                seen.add(citation)
+
+        if citations:
+            return f"\n\nsources: [{'; '.join(citations)}]"
+        return ""
 
     def _generate(self, state: State):
         print('Generating Answer!')
         chat_history = state['chat_history']
-        if len(chat_history) <= 1: 
+        if len(chat_history) <= 1:
             chat_history = []
         messages = PROMPT_TEMPLATE.invoke(
             {
@@ -434,7 +475,12 @@ class Chatbot:
             }
         )
         answer = self.llm.invoke(messages)
-        return {"answer": answer}
+
+        # add citations
+        citations = self._format_citations(state['context'])
+        answer_with_citations = answer.content + citations
+
+        return {"answer": AIMessage(content=answer_with_citations)}
     
     def _decide_to_generate(self, state: State) -> Literal['_transform_query', '_generate']:
         """
@@ -471,7 +517,7 @@ class Chatbot:
 STANDALONE - Question contains ALL information needed to answer it:
   - Mentions specific table numbers, section names, or topics explicitly
   - Examples: "What is table 3.1?", "What are preprocessing options for NLTK in table 3.2?", "Explain PEFT"
-  
+
 FOLLOWUP - Question CANNOT be understood without prior conversation:
   - Uses pronouns (it, they, this, that) referring to unknown subject
   - Examples: "What about the other one?", "How does it work?", "And the second table?"
@@ -485,11 +531,16 @@ CHITCHAT - Greeting or thanks:
 IMPORTANT: If the question mentions specific names, tables, or topics explicitly, it is STANDALONE even if it relates to prior discussion.
 
 Output ONLY: STANDALONE or FOLLOWUP or CLARIFICATION or CHITCHAT"""),
-        ("human", f"Recent conversation:\n{recent_context}\n\nNew query: {question}\n\nClassification:"),
+        ("human", "Recent conversation:\n{recent_context}\n\nNew query: {question}\n\nClassification:"),
     ])
         
         try:
-            result = self.llm.invoke(classification_prompt.format_messages()).content.strip().upper()
+            result = self.llm.invoke(
+                classification_prompt.format_messages(
+                    recent_context=recent_context,
+                    question=question
+                )
+            ).content.strip().upper()
             if '</think>' in result:
                 result = result.split('</think>')[-1].strip().upper()
 
@@ -518,7 +569,9 @@ Output ONLY: STANDALONE or FOLLOWUP or CLARIFICATION or CHITCHAT"""),
         
         if not Config.Chatbot.ENABLE_QUERY_ROUTER:
              return {"question": question}
-        
+# already a clear question
+        if self._is_explicit_question(question):
+            return {"question": question}
         # classify the query
         query_type = self._classify_query(question, real_history)
         print(f"ROUTER: '{question[:50]}...' -> {query_type.value}")
@@ -574,8 +627,8 @@ Output: A symmetric matrix A is positive semidefinite if x^T A x >= 0 for all x.
                 
                 # if the model produced a statement (no '?'), treat it as a search query
                 if not reformulated.endswith('?'):
-                    print(f"CONDENSE: Output '{reformulated}' has no '?', appending one.")
-                    reformulated += "?"
+                    print(f"CONDENSE: Output '{reformulated}' has no '?', using original.")
+                    return {"question": question}
 
                 print(f"CONDENSE: '{question}' -> '{reformulated}'")
                 return {"question": reformulated}
@@ -646,7 +699,6 @@ Output: A symmetric matrix A is positive semidefinite if x^T A x >= 0 for all x.
                     payload = event_data["_retrieve"]
                     documents = payload["context"]
 
-                    # existing dedupe logic
                     unique_docs = []
                     seen_content = set()
                     for doc in documents:
@@ -655,18 +707,10 @@ Output: A symmetric matrix A is positive semidefinite if x^T A x >= 0 for all x.
                             seen_content.add(doc.page_content)
                     yield SourcesEvent(unique_docs)
 
-                    # confidence event
                     confidence = payload.get("confidence")
                     if confidence:
                         yield ConfidenceEvent(confidence)
-                if "_generate" in event_data:
-                    answer = event_data['_generate']['answer']
-                    yield FinalAnswerEvent(answer.content)
 
     def ask(self, prompt: str, chat_history: List[Message]) -> Iterable[SourcesEvent | ChunkEvent | FinalAnswerEvent]:
         for event in self._ask_model(prompt, chat_history):
             yield event
-            if isinstance(event, FinalAnswerEvent):
-                response = _remove_thinking_from_message("".join(event.content))
-                chat_history.append(Message(role=Role.USER, content=prompt))
-                chat_history.append(Message(role=Role.ASSISTANT, content=response))

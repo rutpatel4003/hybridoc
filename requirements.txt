@@ -1,4 +1,6 @@
 pymupdf
+pymupdf4llm
+pymupdf-layout
 langchain_chroma==1.1.0
 langchain_classic==1.0.1
 langchain_community==0.4.1
@@ -12,4 +14,8 @@ pandas==2.3.3
 Pillow==12.1.0
 streamlit==1.52.2
 torch==2.9.1+cu130
-transformers==4.57.3
+transformers>=4.45.0
+qwen-vl-utils
+accelerate
+bitsandbytes
+qdrant-client==1.16.2

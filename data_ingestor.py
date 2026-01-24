@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Dict, Any
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_classic.retrievers import ContextualCompressionRetriever, EnsembleRetriever
 from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
@@ -11,7 +11,8 @@ from langchain_ollama import ChatOllama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from config import Config
 from pdf_loader import File
-from langchain_chroma import Chroma
+from vector_store_qdrant import QdrantVectorStore
+from metadata_extractor import get_metadata_extractor
 import hashlib
 import json
 import re
@@ -20,6 +21,8 @@ from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 from langchain_core.output_parsers import StrOutputParser
 
+# global singleton to avoid loading embeddings multiple times
+_EMBEDDING_MODEL = None
 
 def reciprocal_rank_fusion(
     results_lists: List[List[Document]],
@@ -182,24 +185,29 @@ def create_reranker():
 def create_embeddings():
     """
     Load embedding model with auto device detection.
-    Works on both GPU (fast) and CPU (portable).
+    Uses a global singleton to avoid double-loading on GPU.
     """
+    global _EMBEDDING_MODEL
+    if _EMBEDDING_MODEL is not None:
+        return _EMBEDDING_MODEL
+
     model_name = Config.Preprocessing.EMBEDDING_MODEL
     device = Config.DEVICE
-    
+
     print(f"Loading embeddings on device: {device}")
-    
+
     model_kwargs = {
         "device": device,
         "trust_remote_code": True,
     }
     encode_kwargs = {"normalize_embeddings": True}
 
-    return HuggingFaceEmbeddings(
+    _EMBEDDING_MODEL = HuggingFaceEmbeddings(
         model_name=model_name,
         model_kwargs=model_kwargs,
         encode_kwargs=encode_kwargs,
     )
+    return _EMBEDDING_MODEL
 
 # def _generate_context(llm: ChatOllama, document: str, chunk: str) -> str:
 #     messages = CONTEXT_PROMPT.format_messages(document=document, chunk=chunk)
@@ -301,40 +309,118 @@ def _calculate_file_hash(content: str) -> str:
     """
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
-def _delete_chunks_by_source(vector_store: Chroma, source_name: str):
+def _delete_chunks_by_source(vector_store: QdrantVectorStore, source_name: str):
     """
-    Delete all chunks from Chroma that belong to a specific source file.
-    Called when a file's content hash has changed (needs re-indexing).
+    Delete all chunks that belong to a specific source file
+    called when a file's content hash has changed (needs re-indexing)
     """
     try:
-        results = vector_store.get(where={"source": source_name})
+        results = vector_store.get(filter={"source": source_name})
         ids_to_delete = results.get('ids', [])
-        
+
         if ids_to_delete:
-            vector_store.delete(ids=ids_to_delete)
-            print(f"Deleted {len(ids_to_delete)} stale chunks for '{source_name}'")
+            vector_store.delete(ids_to_delete)
+            print(f"deleted {len(ids_to_delete)} stale chunks for '{source_name}'")
     except Exception as e:
-        print(f"Warning: Could not delete old chunks for {source_name}: {e}")
+        print(f"warning: could not delete old chunks for {source_name}: {e}")
 
 def _create_chunks_from_blocks(file: File, file_hash: str, llm=None) -> List[Document]:
     """
     Create chunks from structured ContentBlocks, preserving page/type metadata.
-    Falls back to text-based chunking if no blocks available.
+    Merges adjacent text blocks and adds context around tables/figures.
     """
-    # fallback: if no content_blocks, use old text-based approach
+    last_text_context = ""
+    last_page = None
+
+    def _find_next_text(start_idx: int, page_num: int) -> str:
+        for j in range(start_idx + 1, len(file.content_blocks)):
+            b = file.content_blocks[j]
+            if b.page_num != page_num:
+                break
+            if b.content_type == "text" and b.content.strip():
+                return b.content.strip()
+        return ""
     if not file.content_blocks:
         doc = Document(
             file.content,
             metadata={'source': file.name, 'content_hash': file_hash}
         )
         return _create_chunks(doc)
-    
-    chunks = []
 
-    # Get full document content for contextualization
+    blocks = file.content_blocks
+    chunks = []
     full_document = file.content if Config.Preprocessing.CONTEXTUALIZE_CHUNKS else None
 
-    for block in file.content_blocks:
+    buffer_text = ""
+    buffer_page = None
+    last_text_context = ""
+
+    def flush_buffer():
+        nonlocal buffer_text, buffer_page, last_text_context
+        if not buffer_text.strip():
+            buffer_text = ""
+            buffer_page = None
+            return
+
+        # save tail for table context
+        last_text_context = buffer_text[-400:]
+
+        base_metadata = {
+            'source': file.name,
+            'content_hash': file_hash,
+            'page': buffer_page,
+            'content_type': 'text',
+        }
+
+        # split if too long
+        if len(buffer_text) > Config.Preprocessing.CHUNK_SIZE:
+            sub_chunks = text_splitter.create_documents(
+                [buffer_text],
+                metadatas=[base_metadata]
+            )
+        else:
+            sub_chunks = [Document(page_content=buffer_text, metadata=base_metadata)]
+
+        # contextualize if enabled
+        if Config.Preprocessing.CONTEXTUALIZE_CHUNKS and llm and full_document:
+            for sc in sub_chunks:
+                context = _generate_context(llm, full_document, sc.page_content)
+                if context:
+                    sc.page_content = f"{context}\n\n{sc.page_content}"
+                    sc.metadata['contextualized'] = True
+
+        chunks.extend(sub_chunks)
+
+        buffer_text = ""
+        buffer_page = None
+
+    def next_text_on_page(start_idx: int, page_num: int) -> str:
+        for j in range(start_idx + 1, len(blocks)):
+            b = blocks[j]
+            if b.page_num != page_num:
+                break
+            if b.content_type == 'text' and b.content.strip():
+                return b.content.strip()
+        return ""
+
+    for i, block in enumerate(blocks):
+        if block.content_type == 'text':
+            if buffer_page is None:
+                buffer_page = block.page_num
+            if block.page_num != buffer_page:
+                flush_buffer()
+                buffer_page = block.page_num
+
+            text = block.content.strip()
+            if text:
+                buffer_text = (buffer_text + "\n" + text).strip()
+            if len(buffer_text) > Config.Preprocessing.CHUNK_SIZE:
+                flush_buffer()
+            continue
+
+        # table/figure: flush text first
+        flush_buffer()
+
         base_metadata = {
             'source': file.name,
             'content_hash': file_hash,
@@ -342,40 +428,44 @@ def _create_chunks_from_blocks(file: File, file_hash: str, llm=None) -> List[Doc
             'content_type': block.content_type,
         }
 
-        # keep as single chunk with table_data
+        context_before = last_text_context[-400:] if last_text_context else ""
+        context_after = next_text_on_page(i, block.page_num)[:400]
+
         if block.content_type == 'table':
-            # serialize table_data to JSON string 
             table_data_json = None
             if block.table_data:
                 table_dict = block.table_data.to_dict()
                 table_data_json = json.dumps(table_dict)
-                MAX_TABLE_DATA_SIZE = 30000 
+                MAX_TABLE_DATA_SIZE = 30000
                 if len(table_data_json) > MAX_TABLE_DATA_SIZE:
-                    print(f"Table too large ({len(table_data_json)} bytes), truncating rows...")
-                    # keep headers + first N rows that fit
-                    truncated_dict = {
+                    truncated = {
                         'headers': table_dict['headers'],
-                        'rows': [],
-                        'raw_markdown': table_dict.get('raw_markdown', '')[:5000],  # truncate markdown too
+                        'rows': table_dict['rows'][:10],
+                        'raw_markdown': table_dict.get('raw_markdown', '')[:5000],
                         'num_rows': table_dict['num_rows'],
                         'num_cols': table_dict['num_cols'],
-                        'truncated': True,  # flag for UI
+                        'truncated': True,
+                        'rows_shown': min(10, len(table_dict['rows']))
                     }
-                    for row in table_dict['rows']:
-                        test_json = json.dumps(truncated_dict)
-                        if len(test_json) < MAX_TABLE_DATA_SIZE - 1000:
-                            truncated_dict['rows'].append(row)
-                        else:
-                            break
-                    truncated_dict['rows_shown'] = len(truncated_dict['rows'])
-                    table_data_json = json.dumps(truncated_dict)
-            
-            # format table content with markers (keeps compatibility with _create_chunks)
-            content = f"[TABLE:]\n{block.content}\n"
+                    table_data_json = json.dumps(truncated)
+
+            # Build table content with semantic enrichment
+            table_content = block.content
             if block.table_data:
-                content += f"\n{block.table_data.to_searchable_text()}\n"
-            content += "[/TABLE]"
-            
+                table_content += f"\n{block.table_data.to_searchable_text()}"
+
+            # Add semantic description if enabled
+            if getattr(Config.Preprocessing, 'ENABLE_TABLE_SEMANTIC_ENRICHMENT', False) and llm:
+                from table_enricher import enrich_table_content
+                table_content = enrich_table_content(table_content, llm)
+
+            content = f"[TABLE:]\n{table_content}\n[/TABLE]"
+
+            if context_before:
+                content = f"[CONTEXT]\n{context_before}\n[/CONTEXT]\n\n{content}"
+            if context_after:
+                content = f"{content}\n\n[CONTEXT]\n{context_after}\n[/CONTEXT]"
+
             chunks.append(Document(
                 page_content=content,
                 metadata={
@@ -383,63 +473,29 @@ def _create_chunks_from_blocks(file: File, file_hash: str, llm=None) -> List[Doc
                     'table_data': table_data_json,
                 }
             ))
-        
-        # FIGURES: keep as single chunk 
+
         elif block.content_type == 'figure':
             content = f"[FIGURE]\n{block.content}\n[/FIGURE]"
+            if context_before:
+                content = f"[CONTEXT]\n{context_before}\n[/CONTEXT]\n\n{content}"
+            if context_after:
+                content = f"{content}\n\n[CONTEXT]\n{context_after}\n[/CONTEXT]"
+
             chunks.append(Document(
                 page_content=content,
-                metadata=base_metadata,
+                metadata=base_metadata
             ))
-        
-        # TEXT: split if large
-        else:
-            text = block.content.strip()
-            if not text:
-                continue
 
-            if len(text) <= Config.Preprocessing.CHUNK_SIZE:
-                chunk_content = text
-
-                # Add contextual information if enabled
-                if Config.Preprocessing.CONTEXTUALIZE_CHUNKS and llm and full_document:
-                    context = _generate_context(llm, full_document, text)
-                    if context:
-                        chunk_content = f"{context}\n\n{text}"
-                        base_metadata['contextualized'] = True
-
-                chunks.append(Document(
-                    page_content=chunk_content,
-                    metadata=base_metadata,
-                ))
-            else:
-                # split large text blocks, each sub-chunk keeps the same page
-                sub_chunks = text_splitter.create_documents(
-                    [text],
-                    metadatas=[base_metadata]
-                )
-
-                # Add context to each sub-chunk if enabled
-                if Config.Preprocessing.CONTEXTUALIZE_CHUNKS and llm and full_document:
-                    contextualized_chunks = []
-                    for sub_chunk in sub_chunks:
-                        context = _generate_context(llm, full_document, sub_chunk.page_content)
-                        if context:
-                            sub_chunk.page_content = f"{context}\n\n{sub_chunk.page_content}"
-                            sub_chunk.metadata['contextualized'] = True
-                        contextualized_chunks.append(sub_chunk)
-                    chunks.extend(contextualized_chunks)
-                else:
-                    chunks.extend(sub_chunks)
-
+    flush_buffer()
     return chunks
 
 def _create_parent_child_chunks(file: File, file_hash: str, llm=None) -> tuple[List[Document], List[Document]]:
     """
-    Create parent-child chunk pairs for improved retrieval.
+    Create parent-child chunk pairs with table/figure context.
+    Parent chunks include surrounding text context so tables are interpretable.
     """
     import uuid
-    
+
     parent_splitter = RecursiveCharacterTextSplitter(
         chunk_size=Config.Preprocessing.PARENT_CHUNK_SIZE,
         chunk_overlap=200
@@ -448,111 +504,129 @@ def _create_parent_child_chunks(file: File, file_hash: str, llm=None) -> tuple[L
         chunk_size=Config.Preprocessing.CHILD_CHUNK_SIZE,
         chunk_overlap=50
     )
-    
+
     parent_chunks = []
     child_chunks = []
     full_document = file.content if Config.Preprocessing.CONTEXTUALIZE_CHUNKS else None
-    
-    # create parent chunks from content blocks
+
+    # fallback
     if not file.content_blocks:
-        # fallback: use raw content
         parent_docs = parent_splitter.create_documents(
             [file.content],
             metadatas=[{'source': file.name, 'content_hash': file_hash, 'content_type': 'text'}]
         )
     else:
+        blocks = file.content_blocks
         parent_docs = []
-        for block in file.content_blocks:
+
+        last_text_context = ""
+        last_page = None
+
+        def update_context(text: str, page_num: int):
+            nonlocal last_text_context, last_page
+            if last_page != page_num:
+                last_text_context = ""
+                last_page = page_num
+            if text:
+                last_text_context = (last_text_context + "\n" + text).strip()
+                if len(last_text_context) > 800:
+                    last_text_context = last_text_context[-800:]
+
+        def next_text_on_page(start_idx: int, page_num: int) -> str:
+            for j in range(start_idx + 1, len(blocks)):
+                b = blocks[j]
+                if b.page_num != page_num:
+                    break
+                if b.content_type == "text" and b.content.strip():
+                    return b.content.strip()
+            return ""
+        for i, block in enumerate(blocks):
             base_meta = {
                 'source': file.name,
                 'content_hash': file_hash,
                 'page': block.page_num,
                 'content_type': block.content_type,
             }
-            
-            # tables/figures stay as single parent 
-            if block.content_type in ('table', 'figure'):
-                content = block.content
-                if block.content_type == 'table':
-                    content = f"[TABLE:]\n{content}\n[/TABLE]"
-                    if block.table_data:
-                        base_meta['table_data'] = json.dumps(block.table_data.to_dict())[:30000]
-                else:
-                    content = f"[FIGURE]\n{content}\n[/FIGURE]"
-                
-                parent_docs.append(Document(page_content=content, metadata=base_meta))
-            else:
-                # Text blocks get split into parents
-                if len(block.content) > Config.Preprocessing.PARENT_CHUNK_SIZE:
+            # text blocks → parents
+            if block.content_type == "text":
+                text = block.content.strip()
+                update_context(text, block.page_num)
+
+                if len(text) > Config.Preprocessing.PARENT_CHUNK_SIZE:
                     splits = parent_splitter.create_documents(
-                        [block.content],
+                        [text],
                         metadatas=[base_meta]
                     )
                     parent_docs.extend(splits)
-                elif block.content.strip():
-                    parent_docs.append(Document(page_content=block.content, metadata=base_meta))
-    
-    # create children from each parent
+                elif text:
+                    parent_docs.append(Document(page_content=text, metadata=base_meta))
+                continue
+            # table/figure: wrap with context
+            context_before = last_text_context[-400:] if last_text_context else ""
+            context_after = next_text_on_page(i, block.page_num)[:400]
+            if block.content_type == "table":
+                table_content = block.content
+                if block.table_data:
+                    base_meta['table_data'] = json.dumps(block.table_data.to_dict())[:30000]
+                    table_content += f"\n{block.table_data.to_searchable_text()}"
+
+                # Add semantic enrichment if enabled
+                if getattr(Config.Preprocessing, 'ENABLE_TABLE_SEMANTIC_ENRICHMENT', False) and llm:
+                    from table_enricher import enrich_table_content
+                    table_content = enrich_table_content(table_content, llm)
+
+                content = f"[TABLE:]\n{table_content}\n[/TABLE]"
+
+            else:  # figure
+                content = f"[FIGURE]\n{block.content}\n[/FIGURE]"
+
+            if context_before:
+                content = f"[CONTEXT]\n{context_before}\n[/CONTEXT]\n\n{content}"
+            if context_after:
+                content = f"{content}\n\n[CONTEXT]\n{context_after}\n[/CONTEXT]"
+
+            parent_docs.append(Document(page_content=content, metadata=base_meta))
+    # create children from parents
     for parent in parent_docs:
         parent_id = str(uuid.uuid4())[:8]
         parent.metadata['parent_id'] = parent_id
         parent.metadata['is_parent'] = True
         parent_chunks.append(parent)
-        
-        # tables/figures: child = parent (don't split further)
         if parent.metadata.get('content_type') in ('table', 'figure'):
             child = Document(
                 page_content=parent.page_content,
-                metadata={
-                    **parent.metadata,
-                    'parent_id': parent_id,
-                    'is_parent': False,
-                }
+                metadata={**parent.metadata, 'parent_id': parent_id, 'is_parent': False}
             )
             child_chunks.append(child)
             continue
-        else:
-            # text: split into smaller children
-            if len(parent.page_content) > Config.Preprocessing.CHILD_CHUNK_SIZE:
-                children = child_splitter.create_documents(
-                    [parent.page_content],
-                    metadatas=[{
-                        **parent.metadata,
-                        'parent_id': parent_id,
-                        'is_parent': False,
-                    }]
-                )
-
-                # add contextualization to children (if enabled)
-                if Config.Preprocessing.CONTEXTUALIZE_CHUNKS and llm and full_document:
-                    for child in children:
-                        context = _generate_context(llm, full_document, child.page_content)
-                        if context:
-                            child.page_content = f"{context}\n\n{child.page_content}"
-                            child.metadata['contextualized'] = True
-
-                child_chunks.extend(children)
-
-            else:
-                child_content = parent.page_content
-
-                if Config.Preprocessing.CONTEXTUALIZE_CHUNKS and llm and full_document:
-                    context = _generate_context(llm, full_document, child_content)
+        if len(parent.page_content) > Config.Preprocessing.CHILD_CHUNK_SIZE:
+            children = child_splitter.create_documents(
+                [parent.page_content],
+                metadatas=[{
+                    **parent.metadata,
+                    'parent_id': parent_id,
+                    'is_parent': False,
+                }]
+            )
+            if Config.Preprocessing.CONTEXTUALIZE_CHUNKS and llm and full_document:
+                for child in children:
+                    context = _generate_context(llm, full_document, child.page_content)
                     if context:
-                        child_content = f"{context}\n\n{child_content}"
+                        child.page_content = f"{context}\n\n{child.page_content}"
+                        child.metadata['contextualized'] = True
+            child_chunks.extend(children)
+        else:
+            child_content = parent.page_content
+            if Config.Preprocessing.CONTEXTUALIZE_CHUNKS and llm and full_document:
+                context = _generate_context(llm, full_document, child_content)
+                if context:
+                    child_content = f"{context}\n\n{child_content}"
+            child_chunks.append(Document(
+                page_content=child_content,
+                metadata={**parent.metadata, 'parent_id': parent_id, 'is_parent': False}
+            ))
 
-                child_chunks.append(Document(
-                    page_content=child_content,
-                    metadata={
-                        **parent.metadata,
-                        'parent_id': parent_id,
-                        'is_parent': False,
-                        'contextualized': Config.Preprocessing.CONTEXTUALIZE_CHUNKS
-                    }
-                ))
-    
     return child_chunks, parent_chunks
-
 
 # global parent store (maps parent_id -> parent Document)
 _parent_store: dict[str, Document] = {}
@@ -567,16 +641,16 @@ def _build_parent_store(parent_chunks: List[Document]):
             _parent_store[pid] = parent
 
 
-def _rebuild_parent_store_from_chroma(vector_store: Chroma):
+def _rebuild_parent_store_from_qdrant(vector_store: QdrantVectorStore):
     """
-    Rebuild parent store from Chroma on startup.
-    Called when loading existing indexed files.
+    Rebuild parent store from qdrant on startup
+    called when loading existing indexed files
     """
     global _parent_store
 
     try:
-        # Get all parent documents from Chroma
-        results = vector_store.get(where={"is_parent": True})
+        # get all parent documents from qdrant
+        results = vector_store.get(filter={"is_parent": True})
 
         if results and results.get('documents'):
             docs = results['documents']
@@ -587,9 +661,9 @@ def _rebuild_parent_store_from_chroma(vector_store: Chroma):
                     parent_doc = Document(page_content=doc_text, metadata=meta)
                     _parent_store[meta['parent_id']] = parent_doc
 
-            print(f"Rebuilt parent store: {len(_parent_store)} parents loaded")
+            print(f"rebuilt parent store: {len(_parent_store)} parents loaded")
     except Exception as e:
-        print(f"Warning: Could not rebuild parent store: {e}")
+        print(f"warning: could not rebuild parent store: {e}")
 
 
 def expand_to_parents(child_docs: List[Document]) -> List[Document]:
@@ -777,26 +851,40 @@ Alternatives:"""
 
 def ingest_files(files: List[File]) -> BaseRetriever:
     """
-    Ingests into a Persistent Vector Database (Chroma)
-    Enhanced with table intelligence, contextual embeddings, and semantic caching
+    Ingest files into Qdrant vector database with rich metadata
+
+    Features:
+    - qdrant vector store (scalable)
+    - rich metadata extraction (document + chunk level)
+    - table intelligence
+    - contextual embeddings (optional)
+    - semantic caching
     """
-    # initialize LLM for contextual embeddings
+    # initialize LLM for contextual embeddings + metadata extraction
     llm = None
-    if Config.Preprocessing.CONTEXTUALIZE_CHUNKS:
-        print("Initializing LLM for contextual chunk embeddings...")
+    if Config.Preprocessing.CONTEXTUALIZE_CHUNKS or getattr(Config.Preprocessing, 'ENABLE_METADATA_EXTRACTION', True):
+        print("initializing LLM for contextual processing...")
         llm = create_llm()
+
+    # initialize metadata extractor
+    use_metadata_extraction = getattr(Config.Preprocessing, 'ENABLE_METADATA_EXTRACTION', True)
+    metadata_extractor = None
+    if use_metadata_extraction:
+        metadata_extractor = get_metadata_extractor(use_llm=True)
+        print("metadata extraction enabled (LLM-powered)")
 
     # initialize embeddings
     embedding_model = create_embeddings()
 
-    # connect to persistent db on disk
-    vector_store = Chroma(
+    # connect to qdrant vector store
+    vector_store = QdrantVectorStore(
         collection_name='private-rag',
         embedding_function=embedding_model,
-        persist_directory=str(Config.Path.VECTOR_DB_DIR)
+        path=str(Config.Path.VECTOR_DB_DIR),
+        embedding_dim=768,  # gte-multilingual-base
     )
 
-    # check for duplicated files
+    # check for existing files (deduplication)
     try:
         existing_data = vector_store.get()
         existing_sources = {}
@@ -806,142 +894,198 @@ def ingest_files(files: List[File]) -> BaseRetriever:
                     source_name = m['source']
                     file_hash = m.get('content_hash', None)
                     existing_sources[source_name] = file_hash
-        
-        table_count = sum(1 for m in existing_data.get('metadatas', []) 
+
+        table_count = sum(1 for m in existing_data.get('metadatas', [])
                          if m and m.get('content_type') == 'table')
-        
-        print(f'Found {len(existing_sources)} files in database ({table_count} table chunks)')
-        print(f'Files: {list(existing_sources.keys())}')
+
+        print(f'found {len(existing_sources)} files in database ({table_count} table chunks)')
+        print(f'files: {list(existing_sources.keys())}')
     except Exception as e:
-        print(f'Error reading database: {e}')
+        print(f'error reading database: {e}')
         existing_sources = {}
 
-        # filter new files only
+    # process files
     new_chunks = []
     skipped_files = []
+    document_metadata_store = {}  # store doc-level metadata
 
     for f in files:
         file_hash = _calculate_file_hash(f.content)
-        
+
+        # check if file already indexed
         if f.name in existing_sources:
             stored_hash = existing_sources[f.name]
             if stored_hash == file_hash:
-                print(f'Skipping {f.name} (already indexed)')
+                print(f'skipping {f.name} (already indexed)')
                 skipped_files.append(f.name)
                 continue
             else:
-                print(f'File {f.name} content changed - deleting old chunks and reprocessing')
+                print(f'file {f.name} changed - deleting old chunks and reprocessing')
                 _delete_chunks_by_source(vector_store, f.name)
 
         # process new file
-        print(f"Indexing: {f.name}")
+        print(f"indexing: {f.name}")
 
-        # use parent-child chunking if enabled
+        # create chunks (with or without parent-child)
         if Config.Preprocessing.ENABLE_PARENT_CHILD:
             child_chunks, parent_chunks = _create_parent_child_chunks(f, file_hash, llm)
             _build_parent_store(parent_chunks)
-            # Store BOTH children and parents in Chroma
-            # Children are used for retrieval, parents for expansion
             file_chunks = child_chunks + parent_chunks
-            print(f"  Created {len(child_chunks)} children, {len(parent_chunks)} parents")
+            print(f"  created {len(child_chunks)} children, {len(parent_chunks)} parents")
         else:
             file_chunks = _create_chunks_from_blocks(f, file_hash, llm)
 
-        # count tables
+        # extract document-level metadata
+        if metadata_extractor:
+            doc_metadata = metadata_extractor.extract_document_metadata(
+                full_text=f.content,
+                filename=f.name,
+                chunks=file_chunks
+            )
+            document_metadata_store[f.name] = doc_metadata.to_dict()
+
+            print(f"  detected: {doc_metadata.doc_type}, {doc_metadata.total_pages} pages, "
+                  f"{doc_metadata.language} language")
+
+            # add document-level metadata to all chunks
+            for chunk in file_chunks:
+                chunk.metadata.update({
+                    'doc_title': doc_metadata.title,
+                    'doc_type': doc_metadata.doc_type,
+                    'doc_language': doc_metadata.language,
+                    'doc_total_pages': doc_metadata.total_pages,
+                })
+
+        # enrich each chunk with chunk-level metadata
+        if metadata_extractor:
+            enriched_chunks = []
+            for idx, chunk in enumerate(file_chunks):
+                enriched_chunk = metadata_extractor.enrich_chunk_metadata(
+                    chunk=chunk,
+                    chunk_index=idx,
+                    full_document=f.content if use_metadata_extraction else None
+                )
+                enriched_chunks.append(enriched_chunk)
+            file_chunks = enriched_chunks
+
+        # count content types
         table_chunks = sum(1 for c in file_chunks if c.metadata.get('content_type') == 'table')
         if table_chunks > 0:
-            print(f"  Found {table_chunks} table(s) in {f.name}")
+            print(f"  found {table_chunks} table(s)")
 
         new_chunks.extend(file_chunks)
 
+    # handle skipped files
     if skipped_files:
-        print(f'Loaded {len(skipped_files)} file(s) from cache')
-        # Rebuild parent store from Chroma for cached files
+        print(f'loaded {len(skipped_files)} file(s) from cache')
         if Config.Preprocessing.ENABLE_PARENT_CHILD:
-            _rebuild_parent_store_from_chroma(vector_store)
+            _rebuild_parent_store_from_qdrant(vector_store)
 
-    # add new chunks to the db only
+    # add new chunks to database
     if new_chunks:
-        print(f'Adding {len(new_chunks)} new chunks to Vector Database')
-        
+        print(f'adding {len(new_chunks)} new chunks to vector database')
+
         # count content types
         tables = sum(1 for c in new_chunks if c.metadata.get('content_type') == 'table')
         figures = sum(1 for c in new_chunks if c.metadata.get('content_type') == 'figure')
         text = len(new_chunks) - tables - figures
-        
+
         print(f'{text} text chunks, {tables} tables, {figures} figures')
-        
+
         vector_store.add_documents(new_chunks)
     else:
-        print('No new content to index')
+        print('no new content to index')
 
-    # create vector retriever (children only if parent-child enabled)
+    # create semantic retriever using the existing vector_store instance
+    # IMPORTANT: reuse the same vector_store to avoid Qdrant lock issues
+    class QdrantRetrieverWrapper(BaseRetriever):
+        """wrapper around existing vector store instance"""
+        vector_store: Any
+        search_kwargs: Dict
+
+        model_config = {"arbitrary_types_allowed": True}
+
+        def _get_relevant_documents(self, query: str) -> List[Document]:
+            k = self.search_kwargs.get('k', 4)
+            filter_dict = self.search_kwargs.get('filter', None)
+            return self.vector_store.similarity_search(query, k=k, filter=filter_dict)
+
+        async def _aget_relevant_documents(self, query: str) -> List[Document]:
+            return self._get_relevant_documents(query)
+
     if Config.Preprocessing.ENABLE_PARENT_CHILD:
-        # Only retrieve children, not parents
-        semantic_retriever = vector_store.as_retriever(
+        semantic_retriever = QdrantRetrieverWrapper(
+            vector_store=vector_store,
             search_kwargs={
                 'k': Config.Preprocessing.N_SEMANTIC_RESULTS,
                 'filter': {'is_parent': False}
             }
         )
     else:
-        semantic_retriever = vector_store.as_retriever(
+        semantic_retriever = QdrantRetrieverWrapper(
+            vector_store=vector_store,
             search_kwargs={'k': Config.Preprocessing.N_SEMANTIC_RESULTS}
         )
 
-    # create bm25 retriever
+    # create BM25 retriever
     db_state = vector_store.get()
     stored_texts = db_state.get('documents', [])
     stored_metadatas = db_state.get('metadatas', [])
 
     if not stored_texts:
-        raise ValueError('Database is empty! Please upload a document.')
+        raise ValueError('database is empty! please upload a document.')
 
-    # reconstruct document objects for BM25 (children only if parent-child enabled)
+    # reconstruct documents for BM25 (children only if parent-child enabled)
     global_corpus = []
     for t, m in zip(stored_texts, stored_metadatas):
         safe_m = m if m else {}
-        # Skip parents for BM25 - we only want to retrieve children
+        # skip parents for BM25
         if Config.Preprocessing.ENABLE_PARENT_CHILD and safe_m.get('is_parent'):
             continue
         global_corpus.append(Document(page_content=t, metadata=safe_m))
 
-    print(f'Building BM25 Index on {len(global_corpus)} chunks (children only)')
+    print(f'building BM25 index on {len(global_corpus)} chunks')
     bm25_retriever = BM25Retriever.from_documents(global_corpus)
     bm25_retriever.k = Config.Preprocessing.N_BM25_RESULTS
+
+    # create ensemble retriever
     if Config.Preprocessing.USE_RRF:
-        print("Using Reciprocal Rank Fusion (RRF) for ensemble")
+        print("using Reciprocal Rank Fusion (RRF) for ensemble")
         ensemble_retriever = RRFRetriever(
             retrievers=[semantic_retriever, bm25_retriever],
             k=Config.Preprocessing.RRF_K
         )
     else:
-        print("Using weighted average for ensemble")
+        print("using weighted average for ensemble")
         ensemble_retriever = EnsembleRetriever(
             retrievers=[semantic_retriever, bm25_retriever],
             weights=[0.6, 0.4]
         )
+
+    # wrap with parent-child if enabled
     if Config.Preprocessing.ENABLE_PARENT_CHILD:
         parent_child_retriever = ParentChildRetriever(child_retriever=ensemble_retriever)
         final_retriever = parent_child_retriever
     else:
         final_retriever = ensemble_retriever
+
+    # add reranker
     reranker = create_reranker()
     if reranker is None:
-        retriever_with_cache = final_retriever
+        retriever_with_reranker = final_retriever
     else:
-        retriever_with_cache = ContextualCompressionRetriever(
+        retriever_with_reranker = ContextualCompressionRetriever(
             base_compressor=reranker,
             base_retriever=final_retriever
         )
 
-    # Wrap with semantic caching (outermost layer)
+    # wrap with semantic caching (outermost layer)
     if Config.Performance.ENABLE_QUERY_CACHE:
-        print("Enabling semantic query caching")
+        print("enabling semantic query caching")
         cached_retriever = CachedRetriever(
-            base_retriever=retriever_with_cache,
-            embedding_model=embedding_model 
+            base_retriever=retriever_with_reranker,
+            embedding_model=embedding_model
         )
         return cached_retriever
 
-    return retriever_with_cache
+    return retriever_with_reranker
