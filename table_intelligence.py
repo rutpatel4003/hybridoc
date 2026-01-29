@@ -1,7 +1,62 @@
 from typing import List, Dict, Optional, Tuple
 import re
 from dataclasses import dataclass
-import json
+
+def normalize_sci(s: str) -> str:
+        """Converts OCR-spaced scientific notation (e.g., '1 . 0 · 10 20') to standard '1.0e20'."""
+        if not isinstance(s, str):
+            return s
+        # only collapse spaces around operators when there are digits nearby
+        # this prevents "model, we" → "model,we" while still fixing "1 , 234" → "1,234"
+        # 1. fix spaced multiplication/dot in scientific notation context
+        s2 = re.sub(r'(\d)\s*([·x*X])\s*(\d)', r'\1\2\3', s)
+        # 2. handle pattern: Coefficient [Symbol] 10 [Whitespace] Exponent
+        pattern = r'(\d+(?:[.,]\d+)?)\s*[·x*X]?\s*10\s*([+-]?\d+)'
+        def replace_match(m):
+            coeff = m.group(1).replace(',', '.')
+            exp = m.group(2)
+            return f"{coeff}e{exp}"
+        return re.sub(pattern, replace_match, s2)
+
+def normalize_text(text: str) -> str:
+    """
+    Normalize OCR artifacts in text:
+    - '0 . 9' → '0.9'
+    - '10 -9' → '10^-9'
+    - 'β 1' → 'β1'
+    - 'ϵ ls' → 'ϵ_ls'
+    - 'P drop' → 'P_drop'
+    - 'warmup _ steps' → 'warmup_steps'
+    Preserves intentional spacing in regular prose.
+    """
+    if not isinstance(text, str):
+        return text
+
+    # 1. fix spaced decimals: '0 . 9' → '0.9', '3 . 5' → '3.5'
+    text = re.sub(r'(\d)\s+\.\s+(\d)', r'\1.\2', text)
+
+    # 2. fix scientific notation: '1 . 0 · 10 20' → '1.0e20'
+    text = normalize_sci(text)
+
+    # 3. fix negative exponents: '10 -9' → '10^-9'
+    text = re.sub(r'(\d+)\s+-\s*(\d+)(?=\s|[.,;:]|$)', r'\1^-\2', text)
+
+    # 4. fix Greek letters with numeric subscripts: 'β 1' → 'β1'
+    text = re.sub(r'([α-ωΑ-Ωϐ-Ͽἀ-῾])\s+(\d+)', r'\1\2', text)
+
+    # 5. fix Greek letters with word subscripts: 'ϵ ls' → 'ϵ_ls'
+    text = re.sub(r'([α-ωΑ-Ωϐ-Ͽἀ-῾])\s+([a-z]+)(?=\s|[=.,;:]|$)', r'\1_\2', text)
+    # 6. fix variable subscripts ONLY when preceded by '=' or at start of string
+    # this prevents "a rate" → "a_rate" while still catching "P drop = " → "P_drop = "
+    # patterns: "= P drop", "P drop =", or start with capital letter + space + lowercase
+    text = re.sub(r'(=\s*)([A-Z])\s+([a-z]+)\b', r'\1\2_\3', text)  # "= P drop" → "= P_drop"
+    text = re.sub(r'\b([A-Z])\s+([a-z]+)(?=\s*=)', r'\1_\2', text)  # "P drop =" → "P_drop ="
+    # also catch single lowercase letter with underscore: "d model", "d ff"
+    text = re.sub(r'\b([a-z])\s+([a-z]+)(?=\s*=)', r'\1_\2', text)  # "d model =" → "d_model ="
+
+    # 7. fix spaced underscores: 'warmup _ steps' → 'warmup_steps'
+    text = re.sub(r'(\w+)\s+_\s+(\w+)', r'\1_\2', text)
+    return text   
 
 @dataclass
 class TableCell:
@@ -33,22 +88,17 @@ class StructuredTable:
             'raw_markdown': self.raw_markdown,
             'num_rows': self.num_rows,
             'num_cols': self.num_cols
-        }
-    
+        }    
     def to_searchable_text(self) -> str:
         """
-        Convert table to searchable plain text
+        Convert table to searchable plain text with explicit column headers.
         """
         lines = []
-        lines.append('TABLE HEADERS: ' + ' | '.join(self.headers)) # add headers
-        for i, row in enumerate(self.rows):
-            row_text = f'Row {i+1}: '
-            row_parts = []
-            for header, value in row.items():
-                if value.strip():
-                    row_parts.append(f'{header}={value}')
-            lines.append(row_text + ', '.join(row_parts))
+        lines.append('Headers: ' + ', '.join(self.headers))
 
+        for i, row in enumerate(self.rows):
+            row_parts = [f'{h}={normalize_sci(str(v))}' for h, v in row.items() if str(v).strip()]
+            lines.append(f'Row {i+1}: ' + ', '.join(row_parts))
         return '\n'.join(lines)
     
 
@@ -113,7 +163,7 @@ class TableExtractor:
             if len(lines) < 2:  # need at least header + separator (data optional)
                 return None
             
-            # Pparse header line
+            # parse header line
             header_line = lines[0]
             headers = [h.strip() for h in header_line.split('|') if h.strip()]
             
@@ -133,7 +183,6 @@ class TableExtractor:
             rows = []
             for line in lines[data_start:]:
                 cells = [c.strip() for c in line.split('|')]
-                
                 # remove empty strings from start/end (from leading/trailing |)
                 if cells and not cells[0]:
                     cells = cells[1:]
@@ -141,7 +190,7 @@ class TableExtractor:
                     cells = cells[:-1]
 
                 if len(cells) == len(headers):
-                    row_dict = dict(zip(headers, cells))
+                    row_dict = {h: normalize_sci(c) for h, c in zip(headers, cells)}
                     rows.append(row_dict)
                 elif len(cells) > 0:
                     # pad or truncate to match headers
@@ -232,68 +281,5 @@ class TableExtractor:
         lines = text.strip().split('\n')
         if len(lines) < 3 and len(text) < 200:
             return True
-        
+
         return False
-    
-class TableQueryHelper:
-    """
-    Helper for querying structured tables
-    """
-    @staticmethod
-    def find_value_in_table(table: StructuredTable, column: str, row_match: Dict[str, str]) -> Optional[str]:
-        """
-        Find a specific value in table
-        """
-        for row in table.rows:
-            # check if all row matches all conditions
-            match = all(
-                row.get(k, "").lower() == v.lower() for k, v in row_match.items()
-            )
-            if match:
-                return row.get(column, None)
-            
-        return None
-    
-    @staticmethod
-    def filter_rows(table: StructuredTable, conditions: Dict[str, str]) -> List[Dict[str, str]]:
-        """
-        Filter table rows based on conditions
-        """
-        matching_rows = []
-        for row in table.rows:
-            match = all(
-                conditions.get(k, '').lower() in row.get(k, '').lower() for k in conditions.keys()
-            )
-
-            if match:
-                matching_rows.append(row)
-
-        return matching_rows
-    
-    @staticmethod
-    def get_column_values(table: StructuredTable, column: str) -> List[str]:
-        """
-        Get all values from a specific column
-        """
-        return [row.get(column, "" ) for row in table.rows if row.get(column, '')]
-    
-    @staticmethod
-    def search_table(table: StructuredTable, query: str) -> List[Dict[str, str]]:
-        """
-        Search entire table for query string
-        """
-        query_lower = query.lower()
-        matching_rows = []
-        for r in table.rows:
-            if any(query_lower in str(value).lower() for value in r.values()):
-                matching_rows.append(r)
-        return matching_rows
-
-
-            
-    
-
-
-
-
-
