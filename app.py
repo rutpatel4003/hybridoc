@@ -8,6 +8,8 @@ import time
 import pandas as pd
 import json
 from chatbot import ConfidenceEvent  
+import hashlib 
+from config import Config
 
 LOADING_MESSAGES = [
     "Hold on, I'm wrestling with some digital hamsters... literally.",
@@ -33,19 +35,66 @@ st.set_page_config(
 
 st.header("Private-RAG")
 st.subheader("Private intelligence for your thoughts and files")
+PIPELINE_VERSION = "2026-01-25-tablefix-1"  # bump when you change retrieval logic
+def get_file_cache_key(files):
+    parts = []
+    for f in files:
+        b = f.getvalue()
+        md5 = hashlib.md5(b).hexdigest()
+        parts.append((f.name, len(b), md5))
+    parts.sort()
 
-def get_file_cache_key(files: List[UploadedFile]) -> str:
-    """Generate cache key from file names and sizes"""
-    file_info = [(f.name, f.size) for f in files]
-    file_info.sort()  # sort for consistent ordering
-    return str(file_info)
+    # include retrieval “shape” so code/config changes invalidate cache
+    cfg_sig = (
+        PIPELINE_VERSION,
+        Config.Performance.ENABLE_QUERY_CACHE,
+        Config.Performance.CACHE_SIMILARITY_THRESHOLD,
+        Config.Chatbot.N_CONTEXT_RESULTS,
+    )
+    return str((parts, cfg_sig))
 
 @st.cache_resource(show_spinner=False)
 def create_chatbot_cached(cache_key: str, files: List[UploadedFile]):
     """Create chatbot with proper caching"""
-    files = [load_uploaded_file(f) for f in files]
+    import torch
+    
+    def log_gpu(step: str):
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"🔍 GPU [{step}]: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+    
+    log_gpu("START")
+    
+    print("\n" + "="*60)
+    print("📄 LOADING FILES...")
+    print("="*60)
+    
+    loaded_files = []
+    for i, f in enumerate(files):
+        log_gpu(f"Before file {i+1}/{len(files)}")
+        loaded_files.append(load_uploaded_file(f))
+        log_gpu(f"After file {i+1}/{len(files)}")
+    
+    print("\n" + "="*60)
+    print("🧹 CLEANUP OCR MODELS...")
+    print("="*60)
+    log_gpu("Before cleanup")
     cleanup_ocr_model()
-    return Chatbot(files)
+    log_gpu("After cleanup")
+    
+    print("\n" + "="*60)
+    print("🤖 CREATING CHATBOT...")
+    print("="*60)
+    log_gpu("Before Chatbot init")
+    chatbot = Chatbot(loaded_files)
+    log_gpu("After Chatbot init")
+    
+    print("\n" + "="*60)
+    print("✅ INITIALIZATION COMPLETE")
+    print("="*60)
+    
+    return chatbot
 
 def show_uploaded_documents() -> List[UploadedFile]:
     holder = st.empty()
@@ -182,17 +231,40 @@ if "messages" not in st.session_state:
 # sidebar with file info
 with st.sidebar:
     st.title("📁 Your Files")
-    for file in chatbot.files:
-        st.markdown(f"**{file.name}**")
-        # show content blocks info if available
-        if file.content_blocks:
-            tables = sum(1 for b in file.content_blocks if b.content_type == 'table')
-            figures = sum(1 for b in file.content_blocks if b.content_type == 'figure')
+
+    for f in chatbot.files:
+        st.markdown(f"**{f.name}**")
+
+        if getattr(f, "content_blocks", None):
+            tables = sum(1 for b in f.content_blocks if b.content_type == "table")
+            figures = sum(1 for b in f.content_blocks if b.content_type == "figure")
             if tables > 0 or figures > 0:
                 st.caption(f"📊 {tables} tables · 🖼️ {figures} figures")
-        st.markdown("---")
+
+    st.markdown("---")
+
+    if st.button("🗑️ Clear Cache & Reset", type="primary"):
+        st.cache_resource.clear()
+        st.cache_data.clear()
+        try:
+            from query_cache import clear_cache
+            clear_cache()
+        except Exception as e:
+            st.warning(f"Could not clear semantic cache: {e}")
+        try:
+            if hasattr(chatbot, "retriever") and hasattr(chatbot.retriever, "cache"):
+                chatbot.retriever.cache.clear()
+        except Exception:
+            pass    
+
+        st.session_state.messages = create_history(WELCOME_MESSAGE)
+        st.success("Cache cleared!")
+        st.rerun()
+
     st.info("💡 Tip: Ask questions about specific table data, like 'What is the price in row 3?' or 'Compare values in the table'")
-# display chat history
+
+# display chat history  
+        
 for message in st.session_state.messages:
     avatar = "🧑‍💻" if message.role == Role.USER else "🤖"
     with st.chat_message(message.role.value, avatar=avatar):

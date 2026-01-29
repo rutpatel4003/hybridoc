@@ -1,22 +1,3 @@
-"""
-Table Semantic Enrichment
-
-Adds rich semantic descriptions to tables to improve retrieval.
-Tables often have captions like "Table 3: Regularization" but the actual
-table data doesn't contain searchable keywords. This module generates
-natural language descriptions that make tables findable.
-
-Example:
-    Caption: "Table 3: Regularization"
-    Markdown: "| Layer | Dropout | Label Smoothing |"
-
-    Enriched: "Table 3: Regularization
-               This table shows regularization hyperparameters including
-               dropout rates and label smoothing values for different layers.
-
-               | Layer | Dropout | Label Smoothing |"
-"""
-
 from typing import Optional
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
@@ -50,17 +31,15 @@ class TableEnricher:
     """
 
     def __init__(self, llm: Optional[ChatOllama] = None):
-        """
-        Args:
-            llm: Optional LLM for description generation
-        """
         if llm is None:
+            # create a short-lived LLM for table enrichment
+            # keep_alive=0 means it unloads immediately after we're done
             self.llm = ChatOllama(
                 model=Config.Model.NAME,
-                temperature=0,
-                num_ctx=1024,
-                num_predict=100,
-                keep_alive=-1,
+                temperature=0,  # deterministic
+                num_ctx=1024,   # small - just need table headers/caption
+                num_predict=100, # short descriptions only
+                keep_alive=0,   # unload after enrichment completes
             )
         else:
             self.llm = llm
@@ -70,16 +49,10 @@ class TableEnricher:
     def _extract_caption_and_headers(self, table_content: str) -> tuple[str, str]:
         """
         Extract caption and headers from table content.
-
-        Args:
-            table_content: Full table text (caption + markdown)
-
-        Returns:
-            (caption, headers_str)
         """
         lines = table_content.strip().split('\n')
 
-        # Find caption (usually first line before markdown table)
+        # find caption (usually first line before markdown table)
         caption = ""
         for i, line in enumerate(lines):
             if line.strip().startswith('|'):
@@ -88,14 +61,14 @@ class TableEnricher:
                     caption = lines[i-1].strip()
                 break
 
-        # Extract headers (first row of markdown table)
+        # extract headers (first row of markdown table)
         headers = ""
         for line in lines:
             if line.strip().startswith('|') and '---' not in line:
                 headers = line.strip()
                 break
 
-        # Clean headers
+        # clean headers
         headers = headers.replace('|', ',').strip(',').strip()
 
         return caption, headers
@@ -103,49 +76,43 @@ class TableEnricher:
     def enrich_table(self, table_content: str) -> str:
         """
         Add semantic description to table content.
-
-        Args:
-            table_content: Original table text (caption + markdown)
-
-        Returns:
-            Enriched table text with semantic description
         """
-        # Skip if table is too short or already enriched
+        # skip if table is too short or already enriched
         if len(table_content) < 20 or "This table shows" in table_content:
             return table_content
 
         caption, headers = self._extract_caption_and_headers(table_content)
 
-        # If no caption or headers, return as-is
+        # if no caption or headers, return as-is
         if not caption and not headers:
             return table_content
 
         try:
-            # Generate semantic description
+            # generate semantic description
             description = self.chain.invoke({
                 'caption': caption if caption else "No caption",
                 'headers': headers if headers else "No headers"
             })
 
-            # Clean thinking tags
+            # clean thinking tags
             if '</think>' in description:
                 description = description.split('</think>')[-1].strip()
 
             description = description.strip()
 
-            # Insert description after caption, before table
+            # insert description after caption, before table
             lines = table_content.strip().split('\n')
 
-            # Find where table starts
+            # find where table starts
             table_start = 0
             for i, line in enumerate(lines):
                 if line.strip().startswith('|'):
                     table_start = i
                     break
 
-            # Build enriched content
+            # build enriched content
             if table_start > 0:
-                # Caption exists, insert description after it
+                # caption exists, insert description after it
                 enriched_lines = (
                     lines[:table_start] +
                     [description, ""] +
@@ -156,16 +123,11 @@ class TableEnricher:
                 enriched_lines = [description, ""] + lines
 
             return '\n'.join(enriched_lines)
-
         except Exception as e:
             print(f"    Table enrichment failed: {e}")
             return table_content
-
-
-# Global instance (lazy init)
+# global instance (lazy init)
 _global_enricher: Optional[TableEnricher] = None
-
-
 def get_table_enricher(llm=None) -> TableEnricher:
     """Get or create global table enricher"""
     global _global_enricher
@@ -173,17 +135,9 @@ def get_table_enricher(llm=None) -> TableEnricher:
         _global_enricher = TableEnricher(llm=llm)
     return _global_enricher
 
-
 def enrich_table_content(table_content: str, llm=None) -> str:
     """
     Convenience function to enrich a single table.
-
-    Args:
-        table_content: Table text to enrich
-        llm: Optional LLM instance
-
-    Returns:
-        Enriched table text
     """
     if not Config.Preprocessing.ENABLE_TABLE_SEMANTIC_ENRICHMENT:
         return table_content

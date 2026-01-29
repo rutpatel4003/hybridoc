@@ -1,12 +1,11 @@
 import re
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 from langchain_core.documents import Document
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from config import Config
-import json
 
 
 @dataclass
@@ -24,7 +23,6 @@ class DocumentMetadata:
 
     def to_dict(self) -> Dict:
         return asdict(self)
-
 
 @dataclass
 class ChunkMetadata:
@@ -49,7 +47,6 @@ class ChunkMetadata:
     def to_dict(self) -> Dict:
         return asdict(self)
 
-
 DOCUMENT_TYPE_PROMPT = ChatPromptTemplate.from_template(
     """Classify this document into ONE category based on its content:
 
@@ -68,7 +65,6 @@ Document preview (first 2000 chars):
 Output ONLY the category name, nothing else."""
 )
 
-
 SECTION_EXTRACTION_PROMPT = ChatPromptTemplate.from_template(
     """Extract the section/chapter heading that appears before this text chunk.
 Rules:
@@ -85,7 +81,6 @@ Chunk:
 Section heading:"""
 )
 
-
 class MetadataExtractor:
     """
     Extracts rich metadata from documents and chunks
@@ -98,12 +93,14 @@ class MetadataExtractor:
         self.llm = None
 
         if use_llm:
+            # create a short-lived LLM for metadata extraction
+            # keep_alive=0 means it unloads immediately once done
             self.llm = ChatOllama(
                 model=Config.Model.NAME,
-                temperature=0,
-                num_ctx=2048,
-                num_predict=50,
-                keep_alive=-1,
+                temperature=0,  # deterministic
+                num_ctx=1024,   # small - just need to extract doc type/language
+                num_predict=50, # very short outputs
+                keep_alive=0,   # unload after extraction completes
             )
             self.doc_type_chain = DOCUMENT_TYPE_PROMPT | self.llm | StrOutputParser()
             self.section_chain = SECTION_EXTRACTION_PROMPT | self.llm | StrOutputParser()
@@ -119,17 +116,14 @@ class MetadataExtractor:
         """
         # detect document type
         doc_type = self._classify_document_type(full_text)
-
         # extract title (first meaningful line or filename)
         title = self._extract_title(full_text, filename)
-
         # count pages (from chunks metadata)
         pages = set()
         for chunk in chunks:
             if 'page' in chunk.metadata:
                 pages.add(chunk.metadata['page'])
         total_pages = len(pages) if pages else 1
-
         # detect content types
         has_tables = any(c.metadata.get('content_type') == 'table' for c in chunks)
         has_figures = any(c.metadata.get('content_type') == 'figure' for c in chunks)
@@ -140,7 +134,6 @@ class MetadataExtractor:
 
         # estimate tokens (rough: 1 token ~= 4 chars)
         estimated_tokens = len(full_text) // 4
-
         return DocumentMetadata(
             title=title,
             doc_type=doc_type,
@@ -178,7 +171,6 @@ class MetadataExtractor:
         # quality assessment
         metadata['is_complete'] = self._is_complete_chunk(text)
         metadata['information_density'] = self._assess_information_density(text)
-
         # section extraction (if LLM enabled and full doc available)
         if self.use_llm and full_document and metadata.get('content_type') == 'text':
             section = self._extract_section(chunk, full_document)
@@ -377,7 +369,6 @@ class MetadataExtractor:
 
 # global instance
 _global_extractor: Optional[MetadataExtractor] = None
-
 
 def get_metadata_extractor(use_llm: bool = True) -> MetadataExtractor:
     """Get or create global metadata extractor instance"""

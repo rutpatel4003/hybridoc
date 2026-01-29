@@ -53,13 +53,9 @@ class ContextualCompressor:
         self.llm = llm
 
         if self.enable and self.llm is None:
-            self.llm = ChatOllama(
-                model=self.model_name,
-                temperature=self.temperature,
-                num_ctx=4096,        # lower memory
-                num_predict=256,
-                keep_alive=0,        # unload after call
-            )
+            # use chatbot LLM (query-time, stays loaded)
+            from data_ingestor import get_chatbot_llm
+            self.llm = get_chatbot_llm()
 
         if self.enable and self.llm is not None:
             self.chain = EXTRACTION_PROMPT | self.llm | StrOutputParser()
@@ -163,7 +159,6 @@ _global_compressor: Optional[ContextualCompressor] = None
 def get_compressor(llm=None) -> ContextualCompressor:
     global _global_compressor
     if _global_compressor is None:
-        from config import Config
         enable_compression = getattr(Config.Chatbot, 'ENABLE_CONTEXTUAL_COMPRESSION', False)
         _global_compressor = ContextualCompressor(
             enable=enable_compression,
