@@ -11,14 +11,11 @@ from qdrant_client.models import (
 )
 from config import Config
 import hashlib
-import uuid
-
 
 class QdrantVectorStore:
     """
     Qdrant vector store with metadata support 
     """
-
     def __init__(
         self,
         collection_name: str,
@@ -59,7 +56,7 @@ class QdrantVectorStore:
             print(f"created qdrant collection: {self.collection_name}")
 
     def add_documents(self, documents: List[Document]) -> List[str]:
-        """Add documents to collection"""
+        """Add documents to collection with batched embedding generation"""
         if not documents:
             return []
 
@@ -67,8 +64,30 @@ class QdrantVectorStore:
         texts = [doc.page_content for doc in documents]
         metadatas = [doc.metadata for doc in documents]
 
-        # generate embeddings
-        embeddings = self.embedding_function.embed_documents(texts)
+        # generate embeddings in batches to avoid GPU OOM
+        from config import Config
+        import torch
+        import gc
+        batch_size = getattr(Config.Performance, 'EMBEDDING_BATCH_SIZE', 8)
+        all_embeddings = []
+        print(f"  Generating embeddings in batches of {batch_size} (total: {len(texts)} chunks)")
+        
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            batch_embeddings = self.embedding_function.embed_documents(batch_texts)
+            all_embeddings.extend(batch_embeddings)
+            
+            # progress indicator
+            if (i + batch_size) % (batch_size * 4) == 0 or i + batch_size >= len(texts):
+                print(f"    Embedded {min(i + batch_size, len(texts))}/{len(texts)} chunks")
+            
+            # cleanup between batches to reduce memory fragmentation
+            if i + batch_size < len(texts):
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        embeddings = all_embeddings
 
         # create points
         points = []
@@ -76,19 +95,26 @@ class QdrantVectorStore:
 
         for text, embedding, metadata in zip(texts, embeddings, metadatas):
             # generate unique ID (use content hash to create valid UUID)
-            content_hash = hashlib.md5(text.encode()).hexdigest()
-
-            # create valid UUID from hash
-            uuid_str = content_hash[:32]
+            chunk_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+            # create valid UUID from chunk_hash
+            uuid_str = chunk_hash[:32]
             point_id = f"{uuid_str[:8]}-{uuid_str[8:12]}-{uuid_str[12:16]}-{uuid_str[16:20]}-{uuid_str[20:32]}"
 
-            # prepare payload (metadata + text)
+            # preserve FILE-level content_hash from metadata (set by data_ingestor)
+            file_hash = None
+            if isinstance(metadata, dict):
+                file_hash = metadata.get("content_hash")
+
             payload = {
-                **metadata,
+                **(metadata or {}),
                 "text": text,
-                "content_hash": content_hash,
+                "chunk_hash": chunk_hash,   # store chunk hash separately
             }
 
+            # if metadata did not have file hash, store one
+            # but ideally data_ingestor always provides it
+            if file_hash is None:
+                payload["content_hash"] = None
             # convert complex metadata to JSON strings
             payload = self._serialize_payload(payload)
 
@@ -97,16 +123,13 @@ class QdrantVectorStore:
                 vector=embedding,
                 payload=payload,
             )
-
             points.append(point)
             point_ids.append(point_id)
-
         # upsert points
         self.client.upsert(
             collection_name=self.collection_name,
             points=points,
         )
-
         return point_ids
 
     def similarity_search(
@@ -121,7 +144,6 @@ class QdrantVectorStore:
 
         # build filter if provided
         qdrant_filter = self._build_filter(filter) if filter else None
-
         # search (version-safe)
         try:
             # query_points returns (points, next_offset)
@@ -137,7 +159,6 @@ class QdrantVectorStore:
                     points, _ = result
                 else:
                     points = result
-
             # fallback: search_points
             elif hasattr(self.client, "search_points"):
                 result = self.client.search_points(
@@ -147,7 +168,6 @@ class QdrantVectorStore:
                     filter=qdrant_filter,
                 )
                 points = result
-
             # fallback: search
             else:
                 points = self.client.search(
@@ -156,7 +176,6 @@ class QdrantVectorStore:
                     limit=k,
                     query_filter=qdrant_filter,
                 )
-
         except Exception as e:
             print(f"Qdrant search failed: {e}")
             return []
@@ -169,11 +188,8 @@ class QdrantVectorStore:
             # safe extraction
             if isinstance(payload, dict):
                 text = payload.pop("text", "")
-                content_hash = payload.pop("content_hash", None)
-
-                # deserialize complex metadata
+                payload.pop("chunk_hash", None)
                 payload = self._deserialize_payload(payload)
-
                 doc = Document(
                     page_content=text,
                     metadata=payload,
@@ -186,7 +202,6 @@ class QdrantVectorStore:
         """Get all points matching filter"""
         # build filter
         qdrant_filter = self._build_filter(filter) if filter else None
-
         # scroll to get all points
         try:
             result = self.client.scroll(
@@ -202,7 +217,6 @@ class QdrantVectorStore:
                 points, _ = result
             else:
                 points = result
-
         except Exception as e:
             print(f"Qdrant scroll failed: {e}")
             return {'documents': [], 'metadatas': [], 'ids': []}
@@ -214,16 +228,14 @@ class QdrantVectorStore:
 
         for point in points:
             payload = dict(point.payload) if hasattr(point, 'payload') else {}
-            text = payload.pop("text", "")
-            content_hash = payload.pop("content_hash", None)
 
+            text = payload.pop("text", "")
+            payload.pop("chunk_hash", None)
             # deserialize complex metadata
             payload = self._deserialize_payload(payload)
-
             documents.append(text)
             metadatas.append(payload)
             ids.append(str(point.id))
-
         return {
             'documents': documents,
             'metadatas': metadatas,
@@ -244,18 +256,48 @@ class QdrantVectorStore:
             print(f"Qdrant delete failed: {e}")
 
     def _build_filter(self, filter_dict: Dict) -> Filter:
-        """Build qdrant filter from dict"""
+        """
+        Build qdrant filter from dict with support for:
+        - Exact match: {"source": "doc.pdf"}
+        - Range queries: {"fiscal_year": {"gte": 2024, "lte": 2025}}
+        - List values: {"source": ["doc1.pdf", "doc2.pdf"]}
+        """
+        from qdrant_client.models import Range, MatchAny
+        
         conditions = []
 
         for key, value in filter_dict.items():
             if value is None:
                 continue
-
-            condition = FieldCondition(
-                key=key,
-                match=MatchValue(value=value),
-            )
-            conditions.append(condition)
+            # range filter: {"fiscal_year": {"gte": 2024, "lte": 2025}}
+            if isinstance(value, dict) and any(k in value for k in ['gte', 'lte', 'gt', 'lt']):
+                range_params = {}
+                if 'gte' in value:
+                    range_params['gte'] = value['gte']
+                if 'lte' in value:
+                    range_params['lte'] = value['lte']
+                if 'gt' in value:
+                    range_params['gt'] = value['gt']
+                if 'lt' in value:
+                    range_params['lt'] = value['lt']
+                    
+                conditions.append(FieldCondition(
+                    key=key,
+                    range=Range(**range_params)
+                ))
+            # list values: {"source": ["doc1.pdf", "doc2.pdf"]}
+            elif isinstance(value, list):
+                conditions.append(FieldCondition(
+                    key=key,
+                    match=MatchAny(any=value)
+                ))
+            # exact match (existing behavior)
+            else:
+                condition = FieldCondition(
+                    key=key,
+                    match=MatchValue(value=value),
+                )
+                conditions.append(condition)
 
         return Filter(must=conditions) if conditions else None
 
@@ -282,16 +324,13 @@ class QdrantVectorStore:
                     serialized[key] = value
                 except (TypeError, ValueError):
                     serialized[key] = json.dumps(value)
-
             # handle dicts
             elif isinstance(value, dict):
                 # serialize to JSON string
                 serialized[key] = json.dumps(value)
-
             # handle other types (serialize to string)
             else:
                 serialized[key] = str(value)
-
         return serialized
 
     def _deserialize_payload(self, payload: Dict) -> Dict:
@@ -318,12 +357,11 @@ def create_qdrant_retriever(
     embedding_function: Any,
     search_kwargs: Optional[Dict] = None,
 ) -> Any:
-    """Create a langchain-compatible retriever from qdrant"""
+    """create a langchain-compatible retriever from qdrant"""
     from langchain_core.retrievers import BaseRetriever
 
     # get qdrant path from config
     qdrant_path = str(Config.Path.VECTOR_DB_DIR)
-
     # create vector store
     vector_store = QdrantVectorStore(
         collection_name=collection_name,
@@ -331,13 +369,11 @@ def create_qdrant_retriever(
         path=qdrant_path,
         embedding_dim=768,  # gte-multilingual-base
     )
-
     # create retriever wrapper
     class QdrantRetriever(BaseRetriever):
         """langchain-compatible qdrant retriever"""
         vector_store: Any
         search_kwargs: Dict
-
         model_config = {"arbitrary_types_allowed": True}
 
         def _get_relevant_documents(self, query: str) -> List[Document]:
