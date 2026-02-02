@@ -1,4 +1,3 @@
-# --- Core PDF / parsing ---
 pymupdf>=1.26.0
 docling>=2.70.0
 docling-surya
@@ -11,7 +10,7 @@ langchain-chroma==1.1.0
 langchain-community==0.4.1
 langchain-core==1.2.6
 langchain-huggingface==1.2.0
-langchain-ollama==1.0.1
+llama-cpp-python
 langchain-text-splitters==1.1.0
 langgraph==1.0.5
 qdrant-client==1.16.2
@@ -22,3 +21,7 @@ streamlit==1.52.2
 sentence-transformers
 rank-bm25
 bitsandbytes
+scikit-learn>=1.3.0
+flash-attn
+torch==2.10.0
+pydantic
