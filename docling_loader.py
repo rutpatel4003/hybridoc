@@ -489,7 +489,6 @@ def extract_pdf_with_docling(file_path: str, use_ocr: bool = True) -> List[Conte
                 import traceback
                 print(f"    Page {page_num}: Extracted Figure {figure_count} (OCR failed: {e})")
                 traceback.print_exc()
-
             content_blocks.append(ContentBlock(
                 content=content,
                 content_type="figure",
@@ -506,12 +505,10 @@ def extract_pdf_with_docling(file_path: str, use_ocr: bool = True) -> List[Conte
                 text = item.text
             elif hasattr(item, 'export_to_markdown'):
                 text = item.export_to_markdown()
-
             if text and text.strip():
                 # check for section headers
                 if hasattr(item, 'label') and item.label in ['section_header', 'title']:
                     current_section = text.strip()
-
                 content_blocks.append(ContentBlock(
                     content=text.strip(),
                     content_type="text",
@@ -519,8 +516,17 @@ def extract_pdf_with_docling(file_path: str, use_ocr: bool = True) -> List[Conte
                     bbox=bbox,
                     section_header=current_section,
                 ))
+    # count block types for verification
+    from collections import Counter
+    block_types = Counter(b.content_type for b in content_blocks)
+    text_count = block_types.get('text', 0) + block_types.get('paragraph', 0) + block_types.get('section_header', 0)
 
     print(f"Docling: Extracted {table_count} tables, {figure_count} figures, {len(content_blocks)} total blocks")
+    print(f"--> Block breakdown: {text_count} text, {table_count} tables, {figure_count} figures")
+
+    # warn if suspiciously low text extraction
+    if text_count < 10 and len(content_blocks) > 20:
+        print(f"WARNING: Only {text_count} text blocks for {len(content_blocks)} total blocks - text extraction may have failed!")
 
     return content_blocks
 
@@ -589,7 +595,7 @@ def format_docling_blocks_as_text(content_blocks: List[ContentBlock]) -> str:
             output.append("")
 
         else:
-            # Standard Text
+            # standard text
             output.append(block.content.strip())
             output.append("")
 
