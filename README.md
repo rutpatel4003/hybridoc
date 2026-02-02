@@ -178,8 +178,8 @@ Automated evaluation using **Qwen3-4B** as judge (same model as chatbot):
 
 ```bash
 # Clone repository
-git clone https://github.com/rutpatel4003/local-rag-assistant.git
-cd local-rag-assistant
+git clone https://github.com/rutpatel4003/hybridoc.git
+cd hybridoc
 
 # Create environment
 python -m venv venv
@@ -199,7 +199,7 @@ pip install -r requirements.txt
 ### **1. Ingest Documents**
 
 ```bash
-python -m data_ingestor --pdf path/to/document.pdf
+streamlit run app.py
 ```
 
 **Supported formats:** PDF, Markdown, Text
@@ -209,11 +209,7 @@ python -m data_ingestor --pdf path/to/document.pdf
 - Contextual chunk enrichment
 - Metadata extraction (page numbers, content types)
 
-### **2. Run Chatbot**
-
-```bash
-streamlit run app.py
-```
+### **2. Run Chatbot (in Streamlit - once ingestion is done)**
 
 **Features:**
 - Token-by-token streaming
@@ -223,7 +219,7 @@ streamlit run app.py
 ### **3. Run Evaluation**
 
 ```bash
-python -m eval.run_full_eval --pdf ../document.pdf
+python -m eval.run_full_eval --pdf ../document.pdf --k 5 --gold-set eval/gold-set.json
 ```
 
 **Outputs:**
@@ -311,18 +307,14 @@ Enhanced: "In the Transformer paper's results section: The model achieved 28.4 B
 
 ## 📈 Roadmap
 
-- [ ] Parent-child chunking (512 char retrieval → 3072 char context)
-- [ ] Query decomposition for multi-hop questions
-- [ ] RAPTOR-lite for document clustering
-- [ ] ColBERT v2 for late interaction retrieval
 - [ ] vLLM integration for batched inference
+- [ ] Dockerize the entire stack
 
 ---
 
 ## 🐛 Known Limitations
 
 - **Multi-hop reasoning:** Requires explicit query decomposition (currently disabled for speed)
-- **Mathematical equations:** OCR'd as text, not LaTeX symbolic representation
 - **Very large PDFs (>200 pages):** May require chunked processing for GPU memory
 
 ---
