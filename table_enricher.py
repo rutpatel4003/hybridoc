@@ -1,8 +1,9 @@
 from typing import Optional
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama
 from langchain_core.output_parsers import StrOutputParser
 from config import Config
+from llama_wrapper import ChatLlamaCppWrapper
+from thinking_utils import strip_thinking_tags
 
 
 TABLE_DESCRIPTION_PROMPT = ChatPromptTemplate.from_template(
@@ -30,21 +31,38 @@ class TableEnricher:
     Enriches table chunks with semantic descriptions for better retrieval.
     """
 
-    def __init__(self, llm: Optional[ChatOllama] = None):
+    def __init__(self, llm: Optional[ChatLlamaCppWrapper] = None):
+        self._owns_llm = (llm is None)  # Track if we created the LLM
         if llm is None:
-            # create a short-lived LLM for table enrichment
-            # keep_alive=0 means it unloads immediately after we're done
-            self.llm = ChatOllama(
-                model=Config.Model.NAME,
+            # create LLM for table enrichment using wrapper
+            model_path = str(Config.Model.GGUF_PATH.resolve())
+            self.llm = ChatLlamaCppWrapper(
+                model_path=model_path,
                 temperature=0,  # deterministic
-                num_ctx=1024,   # small - just need table headers/caption
-                num_predict=100, # short descriptions only
-                keep_alive=0,   # unload after enrichment completes
+                n_ctx=2048,   # small - just need table headers/caption
+                max_tokens=100, # short descriptions only
+                n_gpu_layers=0,  # CPU only to save VRAM
+                n_batch=Config.Model.N_BATCH,
+                n_threads=Config.Model.N_THREADS,
+                streaming=False,
+                verbose=False,
             )
         else:
             self.llm = llm
 
         self.chain = TABLE_DESCRIPTION_PROMPT | self.llm | StrOutputParser()
+
+    def cleanup(self):
+        """Free LLM resources (equivalent to keep_alive=0 in Ollama)"""
+        if self._owns_llm and self.llm is not None:
+            del self.llm
+            self.llm = None
+            import gc
+            gc.collect()
+
+    def __del__(self):
+        """Cleanup on garbage collection"""
+        self.cleanup()
 
     def _extract_caption_and_headers(self, table_content: str) -> tuple[str, str]:
         """
@@ -94,11 +112,8 @@ class TableEnricher:
                 'headers': headers if headers else "No headers"
             })
 
-            # clean thinking tags
-            if '</think>' in description:
-                description = description.split('</think>')[-1].strip()
-
-            description = description.strip()
+            # CRITICAL: Strip thinking tags using robust utility
+            description = strip_thinking_tags(description, aggressive=True)
 
             # insert description after caption, before table
             lines = table_content.strip().split('\n')
@@ -128,12 +143,21 @@ class TableEnricher:
             return table_content
 # global instance (lazy init)
 _global_enricher: Optional[TableEnricher] = None
+
 def get_table_enricher(llm=None) -> TableEnricher:
     """Get or create global table enricher"""
     global _global_enricher
     if _global_enricher is None:
         _global_enricher = TableEnricher(llm=llm)
     return _global_enricher
+
+def cleanup_table_enricher():
+    """Cleanup global table enricher (free LLM resources)"""
+    global _global_enricher
+    if _global_enricher is not None:
+        _global_enricher.cleanup()
+        del _global_enricher
+        _global_enricher = None
 
 def enrich_table_content(table_content: str, llm=None) -> str:
     """
