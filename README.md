@@ -17,7 +17,7 @@ Production-grade RAG system with **3-lane hybrid retrieval**, **vision-based tab
 | **Faithfulness** | 85-95% (LLM-as-Judge scoring) |
 | **Retrieval Accuracy** | Recall@5, MRR tracked via automated eval |
 | **Inference Speed** | <15s end-to-end (24K context window) |
-| **Model Efficiency** | 4.5B params compressed to 3GB via NF4/Q5 quantization |
+| **Model Efficiency** | 4.5B params compressed to 5.9GB VRAM via NF4/Q5 quantization |
 | **Zero API Costs** | 100% local execution |
 
 ---
