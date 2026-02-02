@@ -239,14 +239,17 @@ class Evaluator:
             start_time = time.perf_counter()
             
             try:
+                print("  Generating: ", end="", flush=True)
                 for event in chatbot.ask(question, [Message(role=Role.USER, content="")]):
                     if isinstance(event, SourcesEvent):
                         context_docs = event.content
                     elif isinstance(event, ChunkEvent):
                         answer_chunks.append(event.content)
+                        print(event.content, end="", flush=True)  # Stream live
                     elif isinstance(event, FinalAnswerEvent):
                         # some systems emit final answer event
                         pass
+                print()  # Newline after streaming completes
                 
                 answer = "".join(answer_chunks).strip()
                 latency_ms = (time.perf_counter() - start_time) * 1000
@@ -285,13 +288,17 @@ class Evaluator:
                     }
                     
                     # status indicator
-                    ret_status = "CORRECT" if hit else "WRONG"
-                    faith_emoji = "PASSED" if judgment.faithfulness_score >= 0.7 else "ALMOST PASSED" if judgment.faithfulness_score >= 0.4 else "FAILED"
-                    halluc_flag = "HALLUC" if judgment.hallucination_detected else ""
+                    hit_emoji = "✅" if hit else "❌"
+                    faith_emoji = "✓" if judgment.faithfulness_score >= 0.7 else "~" if judgment.faithfulness_score >= 0.4 else "✗"
+                    halluc_flag = " [HALLUC]" if judgment.hallucination_detected else ""
                     
-                    print(f"{ret_status} Ret | {faith_emoji} Faith={judgment.faithfulness_score:.2f} {halluc_flag}")
+                    print(f"  {hit_emoji} Hit={hit} | Recall@{self.config.k}={recall:.2f} | RR={rr:.2f}")
+                    print(f"  {faith_emoji} Faith={judgment.faithfulness_score:.2f} Rel={judgment.relevance_score:.2f} Compl={judgment.completeness_score:.2f}{halluc_flag}")
+                    # Print generated answer (truncated)
+                    answer_preview = (answer[:500] + "...") if len(answer) > 500 else answer
+                    print(f"  📝 Answer: {answer_preview}")
                     if verbose:
-                        print(f"Reason: {judgment.reasoning[:80]}")
+                        print(f"    Reason: {judgment.reasoning[:100]}")
                 
                 else:
                     result = {
@@ -358,6 +365,7 @@ class Evaluator:
         print(f"{'='*60}")
         print(f"Retrieval Hit Rate:     {aggregate['retrieval_hit_rate']:.1%}")
         print(f"Mean Recall@{self.config.k}:         {aggregate['mean_recall_at_k']:.1%}")
+        print(f"MRR:                    {aggregate['mean_reciprocal_rank']:.3f}")
         print(f"---")
         print(f"Mean Faithfulness:      {aggregate['mean_faithfulness']:.1%}")
         print(f"Mean Relevance:         {aggregate['mean_relevance']:.1%}")

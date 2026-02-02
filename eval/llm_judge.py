@@ -22,11 +22,14 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama
 from langchain_core.output_parsers import StrOutputParser
 import json
 import re
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from llama_wrapper import ChatLlamaCppWrapper
+from thinking_utils import strip_thinking_tags
 
 
 @dataclass
@@ -51,22 +54,30 @@ class JudgmentResult:
         }
 
 FAITHFULNESS_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", f"""You are an expert evaluator for RAG (Retrieval-Augmented Generation) systems.
+    ("system", """You are a STRICT evaluator for RAG (Retrieval-Augmented Generation) systems.
 
 Your task: Assess if the ANSWER is faithful to the CONTEXT (no hallucinations).
+
+IMPORTANT: Be SKEPTICAL. Most answers are NOT perfect. Score critically.
 
 EVALUATION CRITERIA
 
 **1. FAITHFULNESS (0-10)**
-Every claim in the answer must be traceable to the context.
+Every claim in the answer must be EXPLICITLY stated in the context.
 
-Scoring Guide:
-• 10: Perfect - every statement has explicit support in context
-• 8-9: Excellent - minor reasonable inferences from context
-• 6-7: Good - some claims go slightly beyond context but reasonable
-• 4-5: Fair - several claims not in context or questionable inferences
-• 2-3: Poor - significant fabrication or contradicts context
-• 0-1: Failed - complete hallucination, no grounding
+STRICT Scoring Guide:
+• 10: RARE - Every single word/number has explicit verbatim support. No inference.
+• 8-9: Very Good - All key facts correct, tiny stylistic additions only
+• 6-7: Good - Main facts correct, but some minor details not in context
+• 4-5: Mixed - Correct answer but includes unsupported claims
+• 2-3: Poor - Significant fabrication or wrong numbers/names
+• 0-1: Failed - Wrong answer, contradicts context, or complete hallucination
+
+RED FLAGS (lower score immediately):
+- Numbers not exactly matching context
+- Adding context/details not in the source
+- Confident claims about things not mentioned
+- Rounding or paraphrasing numbers differently
 
 **2. RELEVANCE (0-10)**
 Does the answer actually address what was asked?
@@ -116,17 +127,17 @@ EXAMPLES
 Question: "What is the capital of France?"
 Context: "Paris is the capital and largest city of France."
 Answer: "Paris"
-Output: {"faithfulness": 10, "relevance": 10, "completeness": 10, "hallucination_detected": false, "reasoning": "Direct match with context, fully grounded."}
+Output: {{"faithfulness": 10, "relevance": 10, "completeness": 10, "hallucination_detected": false, "reasoning": "Direct match with context, fully grounded."}}
 
 Question: "What is the capital of France?"
 Context: "Paris is the capital and largest city of France."
 Answer: "Paris, with a population of 2.2 million people."
-Output: {"faithfulness": 5, "relevance": 9, "completeness": 7, "hallucination_detected": true, "reasoning": "Answer includes population not mentioned in context."}
+Output: {{"faithfulness": 5, "relevance": 9, "completeness": 7, "hallucination_detected": true, "reasoning": "Answer includes population not mentioned in context."}}
 
 Question: "What is the capital of France?"
 Context: "Lyon is a major city in France."
 Answer: "Paris"
-Output: {"faithfulness": 0, "relevance": 10, "completeness": 0, "hallucination_detected": true, "reasoning": "Answer makes claim not supported by provided context."}
+Output: {{"faithfulness": 0, "relevance": 10, "completeness": 0, "hallucination_detected": true, "reasoning": "Answer makes claim not supported by provided context."}}
 
 
 Now evaluate the following:
@@ -151,25 +162,32 @@ class LLMJudge:
     def __init__(
         self, model_name: str = 'qwen3:4b-thinking',
         temperature: float = 0.0,
-        verbose: bool = False
+        verbose: bool = False,
+        llm = None  # Optional: pass existing LLM instance to reuse
     ):
         """
-        Initialize LLM Judge
+        Initialize LLM Judge.
+        
+        Args:
+            llm: Optional existing LLM to reuse (e.g., from chatbot).
+                 If None, uses the shared chatbot LLM singleton.
         """
         self.model_name = model_name
         self.verbose = verbose
-        self.llm = self.llm = ChatOllama(
-            model=model_name,
-            temperature=temperature,
-            num_ctx=4096,  # need context for full evaluation
-            verbose=verbose,
-            reasoning=True,
-            keep_alive=-1
-        )
+
+        # Reuse the shared chatbot LLM singleton to save GPU memory
+        if llm is not None:
+            self.llm = llm
+            if verbose:
+                print(f'LLM Judge using provided LLM instance')
+        else:
+            from data_ingestor import get_chatbot_llm
+            self.llm = get_chatbot_llm()
+            if verbose:
+                from config import Config
+                print(f'LLM Judge reusing chatbot LLM: {Config.Model.GGUF_PATH.name}')
 
         self.chain = FAITHFULNESS_PROMPT | self.llm | StrOutputParser()
-        if verbose:
-            print(f'LLM Judge Initialized with model: {model_name}')
 
     def _format_context(self, docs: List[Document], max_chars: int = 3000) -> str:
         """
@@ -209,10 +227,9 @@ class LLMJudge:
         - Missing fields
         """
         try:
-            # clean thinking tags if present
-            if '</think>' in raw_output:
-                raw_output = raw_output.split('</think>')[-1].strip()
-            
+            # CRITICAL: Strip thinking tags using robust utility
+            raw_output = strip_thinking_tags(raw_output, aggressive=True)
+
             # remove markdown code blocks
             raw_output = re.sub(r'\s*', '', raw_output)
             raw_output = re.sub(r'```\s*$', '', raw_output)
