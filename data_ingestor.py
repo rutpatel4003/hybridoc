@@ -8,7 +8,8 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.vectorstores import InMemoryVectorStore
-from langchain_ollama import ChatOllama
+from langchain_community.llms import LlamaCpp
+from langchain_community.chat_models import ChatLlamaCpp
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from config import Config
 from pdf_loader import File
@@ -24,7 +25,7 @@ from langchain_classic.retrievers.document_compressors import CrossEncoderRerank
 from langchain_core.output_parsers import StrOutputParser
 from debug_utils import log_gpu_memory
 from typing import Optional, Callable, Tuple
-from transformers import BitsAndBytesConfig, AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification
+from transformers import BitsAndBytesConfig, AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification, AutoModel
 import torch
 
 # global singleton to avoid loading embeddings multiple times
@@ -42,26 +43,41 @@ def _stable_doc_uid(doc: Document) -> str:
     chunk = str(m.get("chunk_id", m.get("chunk_index", "")))
     ctype = str(m.get("content_type", ""))
     label = str(m.get("label", ""))
-
-    # If we have enough metadata, use that.
     if source or file_hash or page or chunk or label:
         raw = f"{source}|{file_hash}|{page}|{chunk}|{ctype}|{label}"
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
-    # Fallback: content hash
+    # fallback: content hash
     return hashlib.md5(doc.page_content.encode("utf-8")).hexdigest()
+
+class PreFilterRetriever(BaseRetriever):
+    """Wraps a retriever to limit docs before expensive reranking."""
+    
+    base_retriever: BaseRetriever
+    max_docs: int = 20
+    
+    def _get_relevant_documents(self, query: str, **kwargs) -> List[Document]:
+        docs = self.base_retriever.invoke(query)
+        if len(docs) > self.max_docs:
+            return docs[:self.max_docs]
+        return docs
+    
+    async def _aget_relevant_documents(self, query: str, **kwargs) -> List[Document]:
+        return self._get_relevant_documents(query, **kwargs)
 
 def reciprocal_rank_fusion(
     results_lists: List[List[Document]],
     k: int = 60,
-    boost_fn: Optional[Callable[[Document], float]] = None,
+    boost_fn: Optional[Callable[[Document, str], float]] = None,
     list_weights: Optional[List[float]] = None,
+    query: str = "",
 ) -> List[Document]:
     """
     Reciprocal Rank Fusion (RRF) with optional per-document boosting and per-list weighting.
 
-    boost_fn(doc) should return a multiplier (e.g., 1.0 normal, 1.5 for tables).
+    boost_fn(doc, query) should return a multiplier (e.g., 1.0 normal, 1.5 for tables).
     list_weights: per-retriever weight multipliers (e.g., [1.0, 1.35] to boost table-only results)
+    query: used for query-aware boosting (exact match detection for MRR improvement)
     """
     doc_scores: dict[str, float] = {}
     doc_objects: dict[str, Document] = {}
@@ -81,7 +97,7 @@ def reciprocal_rank_fusion(
             mult = 1.0
             if boost_fn is not None:
                 try:
-                    mult = float(boost_fn(doc))
+                    mult = float(boost_fn(doc, query))
                     if mult <= 0:
                         mult = 1.0
                 except Exception:
@@ -104,32 +120,84 @@ def reciprocal_rank_fusion(
 
     return fused_docs
 
+def _compute_metadata_relevance(doc: Document, query: str) -> float:
+    """
+    Boost docs where query terms match metadata fields.
+    Enhanced for better MRR (Mean Reciprocal Rank) - exact matches rank higher.
+    """
+    query_lower = query.lower()
+    query_terms = set(query_lower.split())
+    score = 0.0
+    # section header exact match
+    header = str(doc.metadata.get("section_header", ""))
+    if header:
+        header_lower = header.lower()
+        # exact phrase match in header
+        if len(query_lower) > 5 and query_lower in header_lower:
+            score += 0.8  # strong boost for exact phrase in section header
+        else:
+            # partial term overlap
+            header_terms = set(header_lower.split())
+            overlap = len(query_terms & header_terms)
+            score += overlap * 0.2
+
+    # table caption exact match
+    if doc.metadata.get("content_type") == "table":
+        caption = str(doc.metadata.get("caption_label", ""))
+        label = str(doc.metadata.get("label", ""))
+        # direct table reference (e.g., "Table 3", "table 5")
+        table_pattern = r'\btable\s*(\d+|[ivxlcdm]+)\b'
+        query_table_match = re.search(table_pattern, query_lower)
+        if query_table_match:
+            query_table_num = query_table_match.group(0)
+            # check if caption or label contains this table number
+            if caption.lower() in query_lower or query_table_num in caption.lower():
+                score += 1.5  # massive boost for exact table number match
+            elif query_table_num in label.lower():
+                score += 1.5
+        # general table query boosting
+        if "table" in query_lower:
+            score += 0.3  # moderate boost for any table query
+    # document title matching
+    title = str(doc.metadata.get("doc_title", ""))
+    if title:
+        title_lower = title.lower()
+        # exact document name mention
+        if any(term in title_lower for term in query_terms if len(term) > 4):
+            score += 0.15
+    return 1.0 + score  # return multiplier for RRF (1.0 = no boost)
+
 class RRFRetriever(BaseRetriever):
     """
     Custom retriever that uses Reciprocal Rank Fusion (RRF) with optional boosting and list weights.
+    Runs retrievers in parallel for faster performance.
     """
     retrievers: List[BaseRetriever]
     k: int = 60
-    boost_fn: Optional[Callable[[Document], float]] = None
+    boost_fn: Optional[Callable[[Document, str], float]] = None
     list_weights: Optional[List[float]] = None
 
     def _get_relevant_documents(self, query: str) -> List[Document]:
+        from concurrent.futures import ThreadPoolExecutor
+        # parallel retrieval for speed boost
         results_lists = []
-        for retriever in self.retrievers:
-            results_lists.append(retriever.invoke(query))
-
+        if len(self.retrievers) > 1:
+            with ThreadPoolExecutor(max_workers=len(self.retrievers)) as executor:
+                futures = [executor.submit(r.invoke, query) for r in self.retrievers]
+                results_lists = [f.result() for f in futures]
+        else:
+            results_lists = [self.retrievers[0].invoke(query)]
         return reciprocal_rank_fusion(
-            results_lists, 
-            k=self.k, 
-            boost_fn=self.boost_fn, 
-            list_weights=self.list_weights
+            results_lists,
+            k=self.k,
+            boost_fn=_compute_metadata_relevance,
+            list_weights=self.list_weights,
+            query=query  # pass query for exact-match boosting
         )
-
 
 class TablePreservingCompressor:
     """
     Wrap a compressor/reranker and keep at least N table chunks when present.
-
     Cross-encoders often under-rank linearized tables vs prose.
     This ensures at least a small quota of tables survives compression.
     """
@@ -142,21 +210,17 @@ class TablePreservingCompressor:
         compressed = self.base_compressor.compress_documents(documents, query, callbacks=callbacks)
         if self.min_tables == 0:
             return compressed
-
         candidate_tables = [d for d in documents if d.metadata.get("content_type") == "table"]
         if not candidate_tables:
             return compressed
-
         kept_tables = [d for d in compressed if d.metadata.get("content_type") == "table"]
         if len(kept_tables) >= self.min_tables:
             return compressed
-
         needed = self.min_tables - len(kept_tables)
         compressed_keys = {
             (d.metadata.get("source"), d.metadata.get("page"), d.metadata.get("content_hash") or hash(d.page_content))
             for d in compressed
         }
-
         to_add: List[Document] = []
         for t in candidate_tables:
             key = (t.metadata.get("source"), t.metadata.get("page"), t.metadata.get("content_hash") or hash(t.page_content))
@@ -164,7 +228,6 @@ class TablePreservingCompressor:
                 to_add.append(t)
                 if len(to_add) >= needed:
                     break
-
         if not to_add:
             return compressed
 
@@ -209,37 +272,48 @@ text_splitter = RecursiveCharacterTextSplitter(
 )
 
 # LLM for chatbot/query operations
-# Stays loaded (keep_alive=-1) for fast query responses
 _CHATBOT_LLM = None
 
-def get_chatbot_llm() -> ChatOllama:
-    """Get LLM for chatbot/query tasks.
-    
-    Uses keep_alive=-1 to stay loaded for fast responses.
+def get_chatbot_llm():
+    """Get LLM for chatbot/query tasks using llama.cpp.
+
+    Uses ChatLlamaCppWrapper which properly applies chat templates from GGUF.
+    Better compatibility with Qwen3-Thinking models.
+
     Only call this AFTER indexing is complete.
-    
-    Note: Indexing components (metadata_extractor, table_enricher) 
-    create their own short-lived LLMs with keep_alive=0.
+
+    Note: Indexing components (metadata_extractor, table_enricher)
+    create their own short-lived LLMs.
     """
     global _CHATBOT_LLM
     if _CHATBOT_LLM is None:
-        print("Creating chatbot LLM (will stay loaded)...")
-        _CHATBOT_LLM = ChatOllama(
-            model=Config.Model.NAME,
+        from llama_wrapper import ChatLlamaCppWrapper
+
+        model_path = str(Config.Model.GGUF_PATH.resolve())
+
+        if not Config.Model.GGUF_PATH.exists():
+            raise FileNotFoundError(
+                f"Model file not found: {model_path}\n"
+            )
+
+        _CHATBOT_LLM = ChatLlamaCppWrapper(
+            model_path=model_path,
             temperature=Config.Model.TEMPERATURE,
-            num_ctx=8192,
-            num_predict=1024,
-            num_thread=8,
-            keep_alive=-1,  # stay loaded for queries
+            n_ctx=Config.Model.N_CTX,
+            n_gpu_layers=Config.Model.N_GPU_LAYERS,
+            n_batch=Config.Model.N_BATCH,
+            n_threads=Config.Model.N_THREADS,
+            max_tokens=getattr(Config.Model, 'MAX_OUTPUT_TOKENS', 1024),
             streaming=True,
+            verbose=False,
         )
     return _CHATBOT_LLM
 
-def create_llm() -> ChatOllama:
+def create_llm():
     """Deprecated: Use get_chatbot_llm() instead."""
     return get_chatbot_llm()
 
-def _generate_context(llm: ChatOllama, document: str, chunk: str) -> str:
+def _generate_context(llm, document: str, chunk: str) -> str:
     """
     Generate contextual information for a chunk using LLM.
     This implements Anthropic's contextual retrieval technique.
@@ -257,189 +331,126 @@ def _generate_context(llm: ChatOllama, document: str, chunk: str) -> str:
         if '</think>' in context:
             context = context.split('</think>')[-1].strip()
         return context.strip()
-
     except Exception as e:
         print(f"    Context generation failed: {e}")
         return ""
 
-class HFSeqClsCrossEncoder(BaseCrossEncoder):
-    """
-    Pairwise cross-encoder wrapper (query, doc) --> score
-    """
+class JinaV3CrossEncoder(BaseCrossEncoder):
     def __init__(
         self,
-        model_name: str,
-        device: str = "cuda",
+        model_name: str = "jinaai/jina-reranker-v3",
         max_length: int = 1024,
-        batch_size: int = 8,
-        use_fp16: bool = True,
-        use_bnb_4bit: bool = False,
+        batch_size: int = 16, # used for internal chunking of doc lists
+        use_bnb_4bit: bool = True,
     ):
         self.model_name = model_name
-        self.device = device
         self.max_length = max_length
         self.batch_size = batch_size
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        self.tokenizer.padding_side = "right"
-        # make sure padding exists (prevents batch_size>1 crash)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.sep_token
-        if self.tokenizer.pad_token_id is None and self.tokenizer.pad_token is not None:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id or self.tokenizer.sep_token_id
-        model_kwargs = {}
-        torch_dtype = None
-        can_cuda = (device == "cuda") and torch.cuda.is_available()
-        use_fp16 = use_fp16 and can_cuda
-        if use_bnb_4bit and can_cuda:
-            from transformers import BitsAndBytesConfig
+        # NF4 Configuration remains the same for VRAM efficiency
+        quant_config = None
+        if use_bnb_4bit and torch.cuda.is_available():
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.float16,
             )
-            model_kwargs["quantization_config"] = quant_config
-            model_kwargs["device_map"] = "auto"
-            model_kwargs["torch_dtype"] = torch.float16
-        else:
-            # normal fp16/fp32
-            torch_dtype = torch.float16 if use_fp16 else torch.float32
-            model_kwargs["torch_dtype"] = torch_dtype
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_name,
-            **model_kwargs,
-        )
-        # if not quantized + device_map=auto, we move explicitly
-        if not (use_bnb_4bit and can_cuda):
-            self.model = self.model.to("cuda" if can_cuda else "cpu")
 
-        # ensure model also has pad_token_id
-        if getattr(self.model.config, "pad_token_id", None) is None and self.tokenizer.pad_token_id is not None:
-            self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        # Load using AutoModel as specified in the Jina v3 documentation
+        self.model = AutoModel.from_pretrained(
+            model_name,
+            quantization_config=quant_config,
+            dtype=torch.float16,
+            trust_remote_code=True,
+            device_map="cuda" if quant_config else "auto",
+            attn_implementation='flash_attention_2'
+        )
         self.model.eval()
-        self._use_autocast = use_fp16  # only autocast on CUDA fp16
 
     @torch.inference_mode()
     def score(self, text_pairs: List[Tuple[str, str]]) -> List[float]:
         if not text_pairs:
             return []
-        instruction = "Given a query A and a passage B, determine whether the passage contains an answer to the query: "
-        device = next(self.model.parameters()).device
-        out: List[float] = []
-
-        for i in range(0, len(text_pairs), self.batch_size):
-            batch = text_pairs[i : i + self.batch_size]
-            queries = [instruction + q for (q, _) in batch]
-            docs = [d for (_, d) in batch]
-
-            enc = self.tokenizer(
-                queries,
-                docs,
-                padding=True,
-                truncation=True,
-                max_length=self.max_length,
-                return_tensors="pt",
-                return_token_type_ids=False,
+        
+        query = text_pairs[0][0]
+        documents = [d for _, d in text_pairs]
+        all_results = []
+        for i in range(0, len(documents), self.batch_size):
+            chunk = documents[i : i + self.batch_size]
+            batch_results = self.model.rerank(
+                query=query, 
+                documents=chunk,
+                top_n=len(chunk)
             )
-            enc = {k: v.to(device) for k, v in enc.items()}
+            # map results back to original chunk order using the 'index' key
+            chunk_scores = [0.0] * len(chunk)
+            for res in batch_results:
+                chunk_scores[res['index']] = res['relevance_score']
+            all_results.extend(chunk_scores)
+        return all_results
 
-            if self._use_autocast:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    logits = self.model(**enc).logits
-            else:
-                logits = self.model(**enc).logits
-
-            # logits shape usually [B, 1] or [B, 2]; handle both
-            if logits.dim() == 2 and logits.size(-1) == 1:
-                scores = logits.squeeze(-1)
-            else:
-                # if 2-class, treat "relevant" as last logit
-                scores = logits[:, -1]
-
-            out.extend(scores.detach().float().cpu().tolist())
-
-        return out
-
-
-def create_reranker(
-    top_n: int,
-    device: str = "cuda",
-    batch_size: int = 8,
-    max_length: int = 1024,
-    use_bnb_4bit: bool = False,
-):
-    model_name = "BAAI/bge-reranker-v2-m3"
-    actual_device = "cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu"
-    ce = HFSeqClsCrossEncoder(
-        model_name=model_name,
-        device=actual_device,
-        batch_size=batch_size,
-        max_length=max_length,
-        use_fp16=True,
+def create_reranker(top_n: int, use_bnb_4bit: bool = True):
+    """Factory to create the Jina v3 Reranker with NF4 quantization."""
+    ce = JinaV3CrossEncoder(
+        model_name="jinaai/jina-reranker-v3",
         use_bnb_4bit=use_bnb_4bit,
+        batch_size=16
     )
     return CrossEncoderReranker(model=ce, top_n=top_n)
 
 def create_embeddings():
     """
-    Load embedding model with auto device detection.
-    Uses a global singleton to avoid double-loading on GPU.
-    Falls back to CPU if GPU memory is low.
+    Create embedding model with optimized configuration for EmbeddingGemma-300M.
+    Synchronized with the 2,048 token context window.
     """
     global _EMBEDDING_MODEL
     if _EMBEDDING_MODEL is not None:
         return _EMBEDDING_MODEL
 
     model_name = Config.Preprocessing.EMBEDDING_MODEL
+    print(f"Loading embedding model: {model_name}...")
+    device = Config.Preprocessing.EMBEDDING_DEVICE
+    
+    # Gemma-300M performs best with small batches (4 or 8) on local hardware
+    batch_size = getattr(Config.Performance, "EMBEDDING_BATCH_SIZE", 4) 
 
-    # check config for device preference
-    embedding_device = getattr(Config.Preprocessing, 'EMBEDDING_DEVICE', 'auto')
+    try:
+        # Check if using the specialized Gemma embedding model wrapper
+        if "gemma" in model_name.lower() and "embedding" in model_name.lower():
+            from embedding_wrapper import GemmaEmbeddings
+            
+            print(f"Using optimized GemmaEmbeddings wrapper (2048 Context)")
+            _EMBEDDING_MODEL = GemmaEmbeddings(
+                model_name=model_name,
+                device=device,
+                batch_size=batch_size, 
+                max_length=2048
+            )
+        else:
+            model_kwargs = {
+                "device": device,
+                "trust_remote_code": True,
+            }
+            encode_kwargs = {
+                "normalize_embeddings": True,
+                "batch_size": batch_size,
+            }
+            _EMBEDDING_MODEL = HuggingFaceEmbeddings(
+                model_name=model_name,
+                model_kwargs=model_kwargs,
+                encode_kwargs=encode_kwargs,
+            )
+        return _EMBEDDING_MODEL
 
-    if embedding_device == "cpu":
-        device = "cpu"
-    elif embedding_device == "cuda":
-        device = "cuda"
-    else:  # "auto" - check GPU memory
-        device = Config.DEVICE
-        if device == "cuda":
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    # Get free memory
-                    free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
-                    free_gb = free_memory / (1024**3)
-                    # need at least 2GB free for embeddings + working memory
-                    if free_gb < 2.0:
-                        print(f"Low GPU memory ({free_gb:.1f}GB free), using CPU for embeddings")
-                        device = "cpu"
-                    else:
-                        print(f"GPU memory available: {free_gb:.1f}GB")
-            except Exception as e:
-                print(f"Could not check GPU memory: {e}, using CPU")
-                device = "cpu"
-
-    print(f"Loading embeddings on device: {device}")
-    model_kwargs = {
-        "device": device,
-        "trust_remote_code": True,
-    }
-    # add batch size to prevent OOM during embedding
-    encode_kwargs = {
-        "normalize_embeddings": True,
-        "batch_size": getattr(Config.Performance, "EMBEDDING_BATCH_SIZE", 8),
-    }
-    _EMBEDDING_MODEL = HuggingFaceEmbeddings(
-        model_name=model_name,
-        model_kwargs=model_kwargs,
-        encode_kwargs=encode_kwargs,
-    )
-    return _EMBEDDING_MODEL
+    except Exception as e:
+        print(f"\nCritical failure loading embedding model: {model_name}")
+        print(f"Reason: {e}\n")
+        raise
 
 def _create_chunks(document: Document) -> List[Document]:
     """
     Create chunks - tables/figures get surrounding context, text gets split normally.
-    FIXED: Tables/figures include nearby text for better retrieval.
     """
     content = document.page_content
     # pattern to find tables and figures
@@ -523,6 +534,98 @@ def _delete_chunks_by_source(vector_store: QdrantVectorStore, source_name: str):
             print(f"deleted {len(ids_to_delete)} stale chunks for '{source_name}'")
     except Exception as e:
         print(f"warning: could not delete old chunks for {source_name}: {e}")
+
+def _add_contextual_retrieval(chunks: List[Document], file_name: str, llm) -> List[Document]:
+    """
+    Contextual Retrieval: Add 1-2 sentence context to each chunk.
+    """
+    if not Config.Preprocessing.ENABLE_CONTEXTUAL_RETRIEVAL:
+        return chunks
+
+    if not chunks:
+        return chunks
+
+    # cost control: limit number of chunks to contextualize
+    max_chunks = getattr(Config.Preprocessing, 'CONTEXTUAL_RETRIEVAL_MAX_CHUNKS', 1000)
+    if len(chunks) > max_chunks:
+        print(f"Contextual Retrieval: {len(chunks)} chunks > {max_chunks} limit, skipping")
+        return chunks
+
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.output_parsers import StrOutputParser
+    from thinking_utils import strip_thinking_tags
+
+    CONTEXT_PROMPT = ChatPromptTemplate.from_messages([
+        ("system", """You are a document indexer optimizing for search retrieval. Given a chunk of text, generate a context prefix that makes this chunk findable for relevant queries.
+
+OUTPUT FORMAT (2 lines):
+Line 1: [Document, Page X] Topic summary (15-25 words)
+Line 2: Keywords: <comma-separated key terms, entities, metrics, concepts>
+
+KEYWORD EXTRACTION RULES:
+- Extract specific numbers/metrics: "$25.7B revenue", "236B parameters", "Q4 2023", "15% growth"
+- Extract named entities: company names, model names, people, locations
+- Extract technical terms: algorithm names, acronyms (with expansion if present)
+- Extract action/relationship words: "compares", "outperforms", "introduces", "costs"
+- For tables: include column headers and notable row labels
+
+EXAMPLES:
+[Tesla Q4 2023, Page 4] Financial summary showing quarterly revenue, expenses, and profitability metrics
+Keywords: operating expenses, Q4-2023, 2,374 million, total revenues, 25,167, operating margin, 8.2%, YoY growth
+
+[Attention Is All You Need, Page 5] Multi-head attention mechanism architecture and dimensionality
+Keywords: multi-head attention, d_model=512, h=8 heads, scaled dot-product, query key value, transformer
+
+[DeepSeek-V2, Page 12] Model architecture specifications and training compute requirements
+Keywords: 236B parameters, 21B activated, MoE, mixture of experts, training FLOPs, 8.1T tokens
+
+Output ONLY the 2 lines, nothing else."""),
+        ("human", """Document: {document}
+Page: {page}
+Content Type: {content_type}
+
+Chunk:
+{chunk}
+
+Generate context:""")
+    ])
+
+    chain = CONTEXT_PROMPT | llm | StrOutputParser()
+    print(f"Contextual Retrieval: Adding context to {len(chunks)} chunks...")
+    contextualized = []
+    for i, chunk in enumerate(chunks):
+        try:
+            metadata = chunk.metadata or {}
+            doc_name = metadata.get('source', file_name)
+            page = metadata.get('page', metadata.get('page_number', 'unknown'))
+            content_type = metadata.get('content_type', 'text')
+            # generate context
+            context = chain.invoke({
+                "document": doc_name,
+                "page": page,
+                "content_type": content_type,
+                "chunk": chunk.page_content[:500]  # limit to 500 chars for context generation
+            })
+            # strip thinking tags
+            context = strip_thinking_tags(context, aggressive=True)
+            # validate output isn't empty after stripping
+            if not context or len(context) < 10:
+                print(f"Empty context after stripping for chunk {i}, using fallback")
+                context = f"[{doc_name}, Page {page}] {content_type} content"
+            # prepend context to chunk
+            new_content = f"{context.strip()}\n\n{chunk.page_content}"
+
+            contextualized.append(Document(
+                page_content=new_content,
+                metadata=metadata
+            ))
+            if (i + 1) % 50 == 0:
+                print(f"Progress: {i+1}/{len(chunks)} chunks contextualized")
+        except Exception as e:
+            print(f"Failed to contextualize chunk {i}: {e}, keeping original")
+            contextualized.append(chunk)
+    print(f"Contextual Retrieval: {len(contextualized)} chunks contextualized")
+    return contextualized
 
 _CROSS_PAGE_TAG_OPEN = "[CROSS_PAGE_BRIDGE]"
 _CROSS_PAGE_TAG_CLOSE = "[/CROSS_PAGE_BRIDGE]"
@@ -711,7 +814,7 @@ def _create_chunks_from_blocks(file: File, file_hash: str, llm=None) -> List[Doc
             if block.table_data:
                 searchable = block.table_data.to_searchable_text()
                 # cap searchable text to keep embeddings sane
-                MAX_SEARCHABLE = 5000
+                MAX_SEARCHABLE = 8000  
                 if len(searchable) > MAX_SEARCHABLE:
                     searchable = searchable[:MAX_SEARCHABLE] + "\n[TRUNCATED]"
                 table_content += f"\n{searchable}"
@@ -1349,28 +1452,8 @@ def ingest_files(files: List[File]) -> BaseRetriever:
             reserved = torch.cuda.memory_reserved() / 1024**3
             print(f"GPU [{step}]: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
     log_gpu("START of ingest_files")
-    # initialize LLM for contextual embeddings + metadata extraction + table enrichment
-    llm = None
-    needs_llm = (
-        Config.Preprocessing.CONTEXTUALIZE_CHUNKS or 
-        getattr(Config.Preprocessing, 'ENABLE_METADATA_EXTRACTION', True) or
-        getattr(Config.Preprocessing, 'ENABLE_TABLE_SEMANTIC_ENRICHMENT', False)
-    )
-    if needs_llm:
-        print("Initializing LLM for contextual processing...")
-        log_gpu("Before create_llm()")
-        llm = create_llm()
-        log_gpu("After create_llm()")
-    # initialize metadata extractor
-    use_metadata_extraction = getattr(Config.Preprocessing, 'ENABLE_METADATA_EXTRACTION', True)
-    metadata_extractor = None
-    if use_metadata_extraction:
-        log_gpu("Before metadata_extractor init")
-        metadata_extractor = get_metadata_extractor(use_llm=True)
-        log_gpu("After metadata_extractor init")
-        print("metadata extraction enabled (LLM-powered)")
     # initialize embeddings
-    print("📦 Loading embedding model...")
+    print("Loading embedding model...")
     log_gpu("Before embedding model")
     embedding_model = create_embeddings()
     log_gpu("After embedding model")
@@ -1406,6 +1489,9 @@ def ingest_files(files: List[File]) -> BaseRetriever:
     new_chunks = []
     skipped_files = []
     document_metadata_store = {}  # store doc-level metadata
+    # lazy initialization: create metadata extractor only when first needed
+    metadata_extractor = None
+    use_metadata_extraction = getattr(Config.Preprocessing, 'ENABLE_METADATA_EXTRACTION', True)
 
     for f in files:
         file_hash = _calculate_file_hash(f.content)
@@ -1425,18 +1511,23 @@ def ingest_files(files: List[File]) -> BaseRetriever:
         print(f"indexing: {f.name}")
 
         # create chunks (with or without parent-child)
-        # llm is passed to enable table semantic enrichment (improves retrieval)
+        # table enricher creates its own LLM (global singleton, cleaned up after loop)
         if Config.Preprocessing.ENABLE_PARENT_CHILD:
-            child_chunks, parent_chunks = _create_parent_child_chunks(f, file_hash, llm=llm)
+            child_chunks, parent_chunks = _create_parent_child_chunks(f, file_hash, llm=None)
             _build_parent_store(parent_chunks)
             file_chunks = child_chunks + parent_chunks
             print(f"  created {len(child_chunks)} children, {len(parent_chunks)} parents")
             log_gpu_memory(f"After parent-child chunking {f.name}")
         else:
             log_gpu_memory(f"Before standard chunking {f.name}")
-            file_chunks = _create_chunks_from_blocks(f, file_hash, llm=llm)
+            file_chunks = _create_chunks_from_blocks(f, file_hash, llm=None)
             log_gpu_memory(f"After standard chunking {f.name}")
-
+        # lazy initialization: create metadata extractor on first use
+        if use_metadata_extraction and metadata_extractor is None:
+            log_gpu("Creating metadata extractor (first use)")
+            from metadata_extractor import get_metadata_extractor
+            metadata_extractor = get_metadata_extractor(use_llm=True)
+            log_gpu("Metadata extractor loaded")
         # extract document-level metadata
         if metadata_extractor:
             log_gpu_memory(f"Before document metadata extraction {f.name}")
@@ -1459,7 +1550,6 @@ def ingest_files(files: List[File]) -> BaseRetriever:
                     'doc_total_pages': doc_metadata.total_pages,
                 })
             log_gpu_memory(f"After document metadata extraction {f.name}")
-
         # enrich each chunk with chunk-level metadata
         if metadata_extractor:
             log_gpu_memory(f"Before chunk-level metadata enrichment {f.name}")
@@ -1488,8 +1578,80 @@ def ingest_files(files: List[File]) -> BaseRetriever:
         print(f'loaded {len(skipped_files)} file(s) from cache')
         if Config.Preprocessing.ENABLE_PARENT_CHILD:
             _rebuild_parent_store_from_qdrant(vector_store)
+    if metadata_extractor:
+        print("Phase 1 cleanup: Metadata extractor...")
+        try:
+            metadata_extractor.cleanup()
+            del metadata_extractor
+        except Exception as e:
+            print(f"Error: {e}")
 
-    # add new chunks to database
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log_gpu_memory("After metadata extractor cleanup")
+    print("Phase 2 cleanup: Table enricher...")
+    try:
+        from table_enricher import cleanup_table_enricher
+        cleanup_table_enricher()
+    except Exception as e:
+        print(f"Error: {e}")
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    log_gpu_memory("After table enricher cleanup")
+    if new_chunks and Config.Preprocessing.ENABLE_CONTEXTUAL_RETRIEVAL:
+        print("Phase 3: Applying contextual retrieval...")
+        log_gpu_memory("Before contextual retrieval LLM")
+        contextual_llm = None
+        try:
+            contextual_llm = create_llm()
+            log_gpu_memory("After contextual retrieval LLM loaded")
+            new_chunks = _add_contextual_retrieval(
+                new_chunks,
+                file_name="all_files",
+                llm=contextual_llm
+            )
+        finally:
+            if contextual_llm:
+                print("Phase 3 cleanup: Contextual retrieval LLM...")
+                del contextual_llm
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            log_gpu_memory("After contextual retrieval cleanup")
+    if new_chunks and Config.Preprocessing.ENABLE_RAPTOR_LITE:
+        print("Phase 4: Applying RAPTOR hierarchical summaries...")
+        log_gpu_memory("Before RAPTOR LLM")
+        raptor_llm = None
+        try:
+            from raptor_lite import apply_raptor_lite
+            raptor_llm = create_llm()
+            log_gpu_memory("After RAPTOR LLM loaded")
+            original_count = len(new_chunks)
+            new_chunks = apply_raptor_lite(
+                chunks=new_chunks,
+                embedder=embedding_model,
+                llm=raptor_llm
+            )
+            summaries_count = len(new_chunks) - original_count
+            if summaries_count > 0:
+                print(f"  RAPTOR: Added {summaries_count} cluster summaries")
+
+        finally:
+            # always cleanup RAPTOR LLM
+            if raptor_llm:
+                print("Phase 4 cleanup: RAPTOR LLM...")
+                del raptor_llm
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            log_gpu_memory("After RAPTOR cleanup")
+
     if new_chunks:
         print(f'adding {len(new_chunks)} new chunks to vector database')
 
@@ -1499,15 +1661,6 @@ def ingest_files(files: List[File]) -> BaseRetriever:
         text = len(new_chunks) - tables - figures
 
         print(f'{text} text chunks, {tables} tables, {figures} figures')
-
-        # force cleanup before embedding phase to prevent OOM
-        # previous models (metadata extraction LLM) may not have fully released GPU memory
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        log_gpu_memory("Before embedding generation (after cleanup)")
-
         vector_store.add_documents(new_chunks)
         log_gpu_memory("After embedding generation")
     else:
@@ -1594,12 +1747,10 @@ def ingest_files(files: List[File]) -> BaseRetriever:
     def _boost_tables(doc: Document) -> float:
         md = doc.metadata or {}
         ctype = str(md.get("content_type", "")).lower()
-        # boost tables globally inside fusion so they don't lose to captions.
-        # increased boost to ensure they win
-        return 3.0 if ctype == "table" else 1.0
+        return 1.0 # can be changed according to needs, currently set to 1.0 
     # create general ensemble retriever (boosted RRF)
     if Config.Preprocessing.USE_RRF:
-        print("using Reciprocal Rank Fusion (RRF) for ensemble (with table boost)")
+        print("using Reciprocal Rank Fusion (RRF) for ensemble")
         ensemble_retriever = RRFRetriever(
             retrievers=[semantic_retriever, bm25_retriever],
             k=Config.Preprocessing.RRF_K,
@@ -1620,23 +1771,12 @@ def ingest_files(files: List[File]) -> BaseRetriever:
         k=max(30, Config.Preprocessing.RRF_K),
         boost_fn=None  # already table-only
     )
-    # route table-intent queries to tables-first, then merge
-    k_final = getattr(Config.Preprocessing, "N_FINAL_RESULTS", 12)
-    min_tables = getattr(Config.Preprocessing, "MIN_TABLE_RESULTS", 3)
-
-    table_aware = TableAwareRetriever(
-        base_retriever=ensemble_retriever,
-        table_retriever=table_hybrid,
-        k_final=k_final,
-        min_table_results=min_tables
-    )
-
     # wrap with parent-child if enabled
     if Config.Preprocessing.ENABLE_PARENT_CHILD:
-        parent_child_retriever = ParentChildRetriever(child_retriever=table_aware)
+        parent_child_retriever = ParentChildRetriever(child_retriever=ensemble_retriever)
         final_retriever = parent_child_retriever
     else:
-        final_retriever = table_aware
+        final_retriever = ensemble_retriever
     
     # stratified table retrieval (general-purpose)
     if getattr(Config, "Tables", None) and Config.Tables.ENABLE_STRATIFIED_TABLE_RETRIEVAL:
@@ -1688,11 +1828,17 @@ def ingest_files(files: List[File]) -> BaseRetriever:
     if reranker is None:
         retriever_with_reranker = final_retriever
     else:
-        # use table-safe wrapper instead of generic compression
-        # this guarantees table chunks survive reranking for relevant queries
-        retriever_with_reranker = TableSafeCompressionRetriever(
-            compressor=reranker,
-            base_retriever=final_retriever
+        # pre-filter to top N docs before expensive reranking 
+        prefilter_limit = getattr(Config.Chatbot, 'PREFILTER_BEFORE_RERANK', 20)
+        prefiltered_retriever = PreFilterRetriever(
+            base_retriever=final_retriever,
+            max_docs=prefilter_limit
+        )
+        print(f"Pre-filter before rerank: top {prefilter_limit} docs")
+        
+        retriever_with_reranker = ContextualCompressionRetriever(
+            base_compressor=reranker,
+            base_retriever=prefiltered_retriever
         )
 
     # wrap with semantic caching (outermost layer)
