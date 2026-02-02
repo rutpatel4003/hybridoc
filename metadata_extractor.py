@@ -2,10 +2,10 @@ import re
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 from langchain_core.documents import Document
-from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from config import Config
+from llama_wrapper import ChatLlamaCppWrapper
 
 
 @dataclass
@@ -93,17 +93,33 @@ class MetadataExtractor:
         self.llm = None
 
         if use_llm:
-            # create a short-lived LLM for metadata extraction
-            # keep_alive=0 means it unloads immediately once done
-            self.llm = ChatOllama(
-                model=Config.Model.NAME,
+            # create LLM for metadata extraction using wrapper
+            model_path = str(Config.Model.GGUF_PATH.resolve())
+            self.llm = ChatLlamaCppWrapper(
+                model_path=model_path,
                 temperature=0,  # deterministic
-                num_ctx=1024,   # small - just need to extract doc type/language
-                num_predict=50, # very short outputs
-                keep_alive=0,   # unload after extraction completes
+                n_ctx=1024,   # small - just need to extract doc type/language
+                max_tokens=50, # very short outputs
+                n_gpu_layers=0,  # CPU only to save VRAM
+                n_batch=Config.Model.N_BATCH,
+                n_threads=Config.Model.N_THREADS,
+                streaming=False,
+                verbose=False,
             )
             self.doc_type_chain = DOCUMENT_TYPE_PROMPT | self.llm | StrOutputParser()
             self.section_chain = SECTION_EXTRACTION_PROMPT | self.llm | StrOutputParser()
+
+    def cleanup(self):
+        """Free LLM resources"""
+        if self.llm is not None:
+            del self.llm
+            self.llm = None
+            import gc
+            gc.collect()
+
+    def __del__(self):
+        """Cleanup on garbage collection"""
+        self.cleanup()
 
     def extract_document_metadata(
         self,
