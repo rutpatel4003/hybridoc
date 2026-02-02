@@ -52,14 +52,14 @@ def get_qwen_vl_model():
                 quantization_config=quantization_config,
                 device_map="auto",
                 dtype=torch.float16 if device == "cuda" else torch.float32,
-                attn_implementation="flash_attention_2",
+                attn_implementation="flash_attention_2"
             )
         else:
             _qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
                 "Qwen/Qwen3-VL-4B-Instruct",
                 device_map="auto",
                 dtype=torch.float16 if device == "cuda" else torch.float32,
-                attn_implementation="flash_attention_2",
+                attn_implementation="flash_attention_2"
             )
 
         _qwen_processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-4B-Instruct")
