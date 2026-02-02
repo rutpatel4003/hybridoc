@@ -91,14 +91,38 @@ class StructuredTable:
         }    
     def to_searchable_text(self) -> str:
         """
-        Convert table to searchable plain text with explicit column headers.
+        Convert table to searchable text optimized for semantic retrieval.
+        
+        Format: 'RowLabel ColumnHeader: Value' for each cell, enabling queries like
+        'operating expenses Q4 2023' to match 'Operating expenses Q4-2023: 2,374'.
         """
         lines = []
         lines.append('Headers: ' + ', '.join(self.headers))
-
+        
         for i, row in enumerate(self.rows):
-            row_parts = [f'{h}={normalize_sci(str(v))}' for h, v in row.items() if str(v).strip()]
-            lines.append(f'Row {i+1}: ' + ', '.join(row_parts))
+            row_items = list(row.items())
+            if not row_items:
+                continue
+            # first column is typically the row label (metric name, category, etc.)
+            first_key, first_val = row_items[0]
+            row_label = str(first_val).strip() if first_val else ""  
+            # build searchable pairs combining row label with each column
+            parts = []
+            for h, v in row_items[1:]:  # skip first column (already used as label)
+                v_str = normalize_sci(str(v)).strip()
+                if v_str and v_str not in ('-', '—', 'N/A', 'n/a', ''):
+                    if row_label:
+                        # Explicit: "Operating expenses Q4-2023: 2,374"
+                        parts.append(f"{row_label} {h}: {v_str}")
+                    else:
+                        parts.append(f"{h}: {v_str}")
+            # fallback: if only one column or no label detected, use original format
+            if not parts and row_items:
+                parts = [f'{h}={normalize_sci(str(v))}' for h, v in row_items if str(v).strip()]
+            
+            if parts:
+                lines.append(f'Row {i+1}: ' + '; '.join(parts))
+        
         return '\n'.join(lines)
     
 
