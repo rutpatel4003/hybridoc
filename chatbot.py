@@ -4,7 +4,7 @@ from typing import List, TypedDict, Iterable, Literal, Tuple, Dict, Any
 from enum import Enum
 from config import Config
 from dataclasses import dataclass
-from langchain_ollama import ChatOllama
+from langchain_community.chat_models import ChatLlamaCpp
 from langchain_core.documents import Document
 from langchain_core.messages.base import BaseMessage
 from langchain_core.messages import AIMessage, HumanMessage
@@ -20,6 +20,7 @@ import re
 import os
 from query_scoring import QueryScorer
 from data_ingestor import create_embeddings, _stable_doc_uid  # Added for stable dedupe
+from thinking_utils import strip_thinking_tags  # Import thinking tag stripper
 
 DEBUG_LLM_CONTEXT = True          # master switch
 DEBUG_MAX_CONTEXT_CHARS = 1800    # how much of formatted context to print
@@ -52,6 +53,11 @@ SYSTEM_PROMPT = """
 You are a precise data/RAG analyst. Answer the user's question using ONLY the provided <context>.
 The context may include prose, math, and tables. 
 
+CRITICAL GROUNDING RULE (ADDED):
+- If the context contains information but you're unsure how to interpret it -> say "Context contains related information but format is unclear. Please verify manually."
+- NEVER substitute your training knowledge when context exists but is ambiguous
+- When in doubt: "UNCERTAIN based on provided context" > confident wrong answer
+
 NON-NEGOTIABLE RULES
 1) NO OUTSIDE KNOWLEDGE: Use only the provided context. If the answer is not explicitly present, say:
    "Information not found in document."
@@ -60,16 +66,16 @@ NON-NEGOTIABLE RULES
    - If question asks to "name/list/identify/state/provide" specific items or examples:
      * Check TABLES first before prose sections
      * If a table contains the requested items, cite that table FIRST in Evidence
-   - Example: "Name two libraries for X" → prioritize table data over prose mentions
+   - Example: "Name two libraries for X" -> prioritize table data over prose mentions
 
 3) UNIT FIDELITY (CRITICAL):
    - If the question asks for a specific unit or metric (e.g., "FLOPs", "cost", "USD", "percentage"), 
      answer ONLY with that unit.
    - NEVER substitute different units. Examples:
-     * Question asks "training cost in FLOPs" → answer with FLOPs (e.g., 2.3e19), NOT F1 scores or steps
-     * Question asks "F1 score" → answer with F1 (e.g., 91.3), NOT FLOPs or training costs
-     * Question asks "revenue in USD" → answer with USD, NOT units sold or percentages
-     * Question asks "percentage change" → answer with %, NOT absolute values
+     * Question asks "training cost in FLOPs" -> answer with FLOPs (e.g., 2.3e19), NOT F1 scores or steps
+     * Question asks "F1 score" -> answer with F1 (e.g., 91.3), NOT FLOPs or training costs
+     * Question asks "revenue in USD" -> answer with USD, NOT units sold or percentages
+     * Question asks "percentage change" -> answer with %, NOT absolute values
    - If the requested unit/metric is not in context, say: "Information not found in document."
    - Do NOT answer with a related but different metric.
    - WARNING: FLOPs (floating point operations) ≠ F1 scores (accuracy metric). Never confuse these!
@@ -87,6 +93,11 @@ NON-NEGOTIABLE RULES
      c) Verify the requested column exists in the Headers
      d) Scan EVERY "Row N:" line to find values for that column
      e) Extract data from the EXACT column name shown in Headers
+     f) **CRITICAL: If a Row contains multiple metrics separated by semicolons (;), READ CAREFULLY:**
+        - Example: "Row 1: Profitability=$8.9B operating income; $15.0B net income; $7.9B in Q4"
+        - This contains BOTH "operating income" AND "net income" - they are DIFFERENT metrics!
+        - Question asks "net income" → answer is $15.0B or $7.9B (Q4), NOT $8.9B (operating income)
+        - DO NOT confuse operating income with net income!
 
    If multiple tables exist, identify which table contains the requested metric BEFORE extracting data.
    Quote specific sources: "From Table 2, Row 9, column 'Training Cost (FLOPs).EN-DE': 3.3e18"
@@ -98,6 +109,7 @@ NON-NEGOTIABLE RULES
      c) Verify you're looking at the correct table and column
      d) Check for values in both tables AND surrounding prose
    - If you see "P_drop = 0.1" or similar explicit values, DO NOT say "not explicitly stated"
+   - **MANDATORY: If you find a metric but answer "not found", you will be penalized severely.**
    - Only claim "not found" after exhaustively checking all sources.
 
 6) TABLES ARE AUTHORITATIVE:
@@ -113,7 +125,16 @@ NON-NEGOTIABLE RULES
    - If the question asks about an equation/derivation, quote the exact formula(s) from context.
 
 9) LANGUAGE:
-   - Always answer in English. No other language. 
+   - Always answer in English. No other language.
+
+10) CITATION PROTOCOL (MANDATORY - ANTI-HALLUCINATION):
+   - Every factual claim MUST be verifiable in the context
+   - Numbers: Verify exact match in context before stating
+   - If stating a number from a table: cite [Table N, Row X] or [Table N, Column Y]
+   - If stating from prose: cite [Source: filename, Page N] when available
+   - NEVER make up numbers that don't appear in context
+   - UNCERTAINTY RULE: If unsure about a number, respond "UNCERTAIN: [reason]" instead of guessing
+   - PENALTY: Stating a number not in context = hallucination
 
 HOW TO ANSWER (MANDATORY)
 A) First, identify what unit/metric the question asks for.
@@ -402,7 +423,8 @@ class Chatbot:
         self.llm = get_chatbot_llm()
         self.workflow = self._create_workflow()
         self.query_scorer = QueryScorer(embedder=create_embeddings()) if Config.Chatbot.ENABLE_QUERY_SCORING else None
-    def _format_docs(self, docs: List[Document], max_chars_text: int = 3000, max_table_rows: int = 20) -> str:
+
+    def _format_docs(self, docs: List[Document], max_chars_text: int = 2700, max_table_rows: int = 20) -> str:
         formatted = []
         for doc in docs:
             md = doc.metadata or {}
@@ -439,8 +461,8 @@ class Chatbot:
                         content += f"\nNote: showing top {max_table_rows} rows."
                 else:
                     # no row lines --> might be a pure markdown grid table.
-                    if len(content) > 3000:
-                        content = content[:3000] + "\n[...truncated...]"
+                    if len(content) > max_chars_text:
+                        content = content[:max_chars_text] + "\n[...truncated...]"
             formatted.append(FILE_TEMPLATE.format(
                 name=md.get('source', 'Unknown'),
                 content=content
@@ -504,6 +526,13 @@ class Chatbot:
             from contextual_compressor import get_compressor
             compressor = get_compressor(llm=self.llm)
             context = compressor.compress(context, question)
+        # final context limit (after all expansions)
+        max_final = getattr(Config.Chatbot, 'MAX_FINAL_CONTEXT_CHUNKS', 16)
+        if len(context) > max_final:
+            original_len = len(context)
+            context = context[:max_final]
+            print(f"  Final limit: {original_len} → {max_final} chunks (capped to prevent context overflow)")
+
         # confidence scoring
         confidence = None
         if getattr(Config.Chatbot, 'ENABLE_QUERY_SCORING', False) and self.query_scorer:
@@ -610,7 +639,7 @@ class Chatbot:
             # apply contextual compression if enabled
             if getattr(Config.Chatbot, 'ENABLE_CONTEXTUAL_COMPRESSION', False):
                 from contextual_compressor import get_compressor
-                compressor = get_compressor()
+                compressor = get_compressor(llm=self.llm)
                 merged = compressor.compress(merged, question)
             return {"context": merged}
         except Exception as e:
@@ -715,15 +744,12 @@ class Chatbot:
 
     def _generate(self, state: State):
         print('Generating Answer!')
-        self._debug_dump_context(state["question"], state["context"]) 
-        
         # get the raw retrieved docs from state
         retrieved_docs = state.get("context", [])
-        
         # slice tables for the LLM context
         docs_for_llm, _ = extract_table_slices(
-            state["question"], 
-            retrieved_docs, 
+            state["question"],
+            retrieved_docs,
             max_rows_per_table=20
         )
         # format the sliced docs for the prompt
@@ -876,12 +902,11 @@ Output: A symmetric matrix A is positive semidefinite if x^T A x >= 0 for all x.
             try:
                 chain = condense_prompt | self.llm | StrOutputParser()
                 reformulated = chain.invoke({
-                    "chat_history": recent_history, 
+                    "chat_history": recent_history,
                     "question": question
                 }).strip()
-                # clean thinking tags
-                if '</think>' in reformulated:
-                    reformulated = reformulated.split('</think>')[-1].strip()
+                # strip thinking tags from Qwen3-Thinking output
+                reformulated = strip_thinking_tags(reformulated, aggressive=True)
                 # if the model produced a statement (no '?'), treat it as a search query
                 if not reformulated.endswith('?'):
                     print(f"CONDENSE: Output '{reformulated}' has no '?', using original.")
