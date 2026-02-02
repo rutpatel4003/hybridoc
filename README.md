@@ -143,8 +143,8 @@ Automated evaluation using **Qwen3-4B** as judge (same model as chatbot):
 
 | Stage | Latency | Notes |
 |-------|---------|-------|
-| **Retrieval** (RRF + Rerank) | 8-12s | Pre-filter optimization |
-| **LLM Generation** | 10-15s | 18K context, ~300-400 token answer |
+| **Retrieval** (RRF + Rerank) | 3-5s | Pre-filter optimization |
+| **LLM Generation** | 8-12 | 18K context, ~300-400 token answer |
 | **Total (end-to-end)** | <15s | With streaming enabled |
 | **Query Cache Hit** | 200-500ms | Semantic similarity ≥ 0.90 |
 
