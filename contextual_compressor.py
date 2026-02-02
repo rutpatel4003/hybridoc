@@ -1,7 +1,6 @@
 from typing import List, Optional
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama
 from langchain_core.output_parsers import StrOutputParser
 from config import Config
 
