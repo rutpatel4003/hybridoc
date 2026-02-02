@@ -1,7 +1,5 @@
 import os
 from pathlib import Path
-from loguru import logger
-import sys
 
 def get_device() -> str:
     """
@@ -22,8 +20,14 @@ class Config:
     DEVICE = get_device()
 
     class Model:
-            NAME = 'qwen3:4b-instruct'  # fast for user-facing responses
+            # llama.cpp GGUF model path (from unsloth/Qwen3-4B-Thinking-2507-GGUF)
+            GGUF_PATH = Path(__file__).parent / "models" / "Qwen3-4B-Instruct-2507-UD-Q5_K_XL.gguf"
             TEMPERATURE = 0.1
+            N_CTX = 18432 # increased context window (thinking tokens stripped before context build)
+            N_GPU_LAYERS = -1  # -1 = full GPU offload, 0 = CPU-only
+            N_BATCH = 1024  # prompt processing batch size (512 = good balance)
+            N_THREADS = 8  # CPU threads (if not using GPU)
+            MAX_OUTPUT_TOKENS = 1024  # limit output length
 
     class Preprocessing:
         CHUNK_SIZE = 2000
@@ -33,17 +37,22 @@ class Config:
         ENABLE_CROSS_PAGE_BRIDGING = True
         CROSS_PAGE_CONTEXT_CHARS = 800 # from 600
         CROSS_PAGE_MIN_TEXT_CHARS = 120
-        EMBEDDING_MODEL = "Alibaba-NLP/gte-multilingual-base"
-        EMBEDDING_DEVICE = "auto"  # "auto", "cuda", or "cpu" - use "cpu" if GPU OOM after OCR
-        RERANKER = 'cross-encoder/ms-marco-MiniLM-L12-v2'
+
+        # contextual retrieval: add 1-2 sentence context to each chunk
+        ENABLE_CONTEXTUAL_RETRIEVAL = True
+        CONTEXTUAL_RETRIEVAL_MAX_CHUNKS = 500  # reduced for speed if re-enabled
+        # embedding model: google's embeddinggemma-300m
+        # requires task prefixes: "search_query: " and "search_document: "
+        EMBEDDING_MODEL = "google/embeddinggemma-300m"
+        EMBEDDING_DEVICE = "cuda"  # "auto", "cuda", or "cpu" - use "cpu" if GPU OOM after OCR
         CONTEXTUALIZE_CHUNKS = False
-        N_SEMANTIC_RESULTS = 10
-        N_BM25_RESULTS = 10
+        N_SEMANTIC_RESULTS = 20
+        N_BM25_RESULTS = 20
         ENABLE_PARENT_CHILD = False
         PARENT_CHUNK_SIZE = 3072  # larger chunks for LLM context
-        CHILD_CHUNK_SIZE = 500    # smaller chunks for precise retrieval
+        CHILD_CHUNK_SIZE = 384    # smaller chunks for precise retrieval
         USE_RRF = True  # use Reciprocal Rank Fusion
-        RRF_K = 60
+        RRF_K = 30
         
         # PDF Parsing options
         USE_DOCLING = True  # use Docling + Surya OCR as primary parser (best for tables)
@@ -60,24 +69,26 @@ class Config:
         # PyMuPDF fallback control
         ENABLE_PYMUPDF_FALLBACK = True  # use native PyMuPDF tables even when Docling succeeds
 
+        # RAPTOR Lite: Hierarchical summarization
+        ENABLE_RAPTOR_LITE = False  # create cluster summaries for better multi-hop retrieval
     class Chatbot:
-        N_CONTEXT_RESULTS = 7
+        N_CONTEXT_RESULTS = 10  
         GRADING_MODE = False
         ENABLE_QUERY_ROUTER = True
         ROUTER_HISTORY_WINDOW = 4
-        ENABLE_HYDE = False
+        ENABLE_HYDE = False  # generate hypothetical answer to improve retrieval
         ENABLE_MULTI_QUERY = False
-        ENABLE_CONTEXTUAL_COMPRESSION = False   
-        ENABLE_QUERY_DECOMPOSITION = True
+        ENABLE_CONTEXTUAL_COMPRESSION = False
+        ENABLE_QUERY_DECOMPOSITION = False
         DECOMPOSE_MAX_SUBQUESTIONS = 3
         DECOMPOSE_MIN_WORDS = 10
-        ENABLE_QUERY_SCORING = True
+        ENABLE_QUERY_SCORING = False
         QUERY_SCORE_TOP_K = 3
         QUERY_SCORE_WEIGHTS = {"semantic": 0.7, "lexical": 0.3}
         QUERY_SCORE_THRESHOLDS = {"high": 0.75, "medium": 0.55}
         COMPRESSION_MIN_RATIO = 0.8
         COMPRESSION_MAX_DOC_LENGTH = 1200
-        DEBUG_LLM_CONTEXT = True
+        DEBUG_LLM_CONTEXT = False
         DEBUG_CONTEXT_FILEPATH = "llm_context_debug.txt"
 
         # Neighbor Expansion: expand retrieved chunks to include adjacent chunks
@@ -88,6 +99,8 @@ class Config:
         NEIGHBOR_ENABLE_FORWARD = True  # expand to next chunks
         NEIGHBOR_ENABLE_BACKWARD = True  # expand to previous chunks
         NEIGHBOR_DEBUG = False  # print expansion debug info
+        MAX_FINAL_CONTEXT_CHUNKS = 16  # Reduced from 16 to prevent context overflow (16K limit)
+        PREFILTER_BEFORE_RERANK = 20   # Limit docs sent to reranker (RRF gives 30+, rerank only top 20)
 
     class Eval:
         """Evaluation settings"""
@@ -95,7 +108,7 @@ class Config:
         K = 4  # recall@k
         OUTPUT_DIR = "eval/results"
         ENABLE_LLM_JUDGE = True
-        JUDGE_MODEL = "qwen3:4b-thinking"  # Model for LLM-as-judge evaluation
+        JUDGE_MODEL = "chatbot_llm"  # Uses same LLM as chatbot (shared singleton)
         JUDGE_TEMPERATURE = 0
         FAITHFULNESS_THRESHOLD = 0.7
         HALLUCINATION_THRESHOLD = 0.4 
@@ -109,7 +122,7 @@ class Config:
          """
          Production performance settings
          """
-         EMBEDDING_BATCH_SIZE = 8  # batch size for embedding generation (conservative for 6GB GPU)
+         EMBEDDING_BATCH_SIZE = 4  # batch size for embedding generation (conservative for 6GB GPU)
          USE_MULTIPROCESSING = True
          MAX_WORKERS = 6
          ENABLE_QUERY_CACHE = True
@@ -124,14 +137,24 @@ class Config:
         General-purpose table support:
         ensure tables remain retrievable without domain-specific keyword triggers.
         """
-        ENABLE_STRATIFIED_TABLE_RETRIEVAL = True
-
+        ENABLE_STRATIFIED_TABLE_RETRIEVAL = True  # separate lane for tables with neutral weight
         # candidate counts for the table-only retriever
-        N_TABLE_SEMANTIC_RESULTS = 6
-        N_TABLE_BM25_RESULTS = 6
-
+        N_TABLE_SEMANTIC_RESULTS = 3
+        N_TABLE_BM25_RESULTS = 3
         # how strongly table-only results influence fused ranking
-        TABLE_LIST_WEIGHT = 1.35
-
-        # reranker guardrail (Priority 1 uses this)
+        TABLE_LIST_WEIGHT = 1.2 
+        # reranker guardrail 
         MIN_TABLES_IN_CONTEXT = 2
+
+    class Raptor:
+        """
+        RAPTOR Lite: Hierarchical summarization for improved multi-hop retrieval.
+        Creates cluster summaries that provide high-level context.
+        """
+        # number of clusters (None = auto-calculate using sqrt(n/2) heuristic)
+        NUM_CLUSTERS = None
+        # cluster size constraints
+        MIN_CLUSTER_SIZE = 3   # skip clusters smaller than this
+        MAX_CLUSTER_SIZE = 50  # split large clusters
+        # summary generation
+        SUMMARY_MODEL = None  # None = use chatbot LLM
